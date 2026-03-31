@@ -1,0 +1,295 @@
+---
+title: "Transaction"
+description: "RAII transaction guard over an Arena. Auto-rolls back on drop unless committed."
+---
+
+`Transaction` is a scoped RAII guard over an [`Arena`](/api/arena). All allocations made through the guard are rolled back automatically when it is dropped, unless `commit()` is called first. This makes arena operations atomic — either every allocation in the scope survives, or none do.
+
+## Overview
+
+```
+open (arena.transaction() or arena.with_transaction(...))
+  │
+  ├── allocate: txn.alloc(...), txn.alloc_slice(...), etc.
+  │
+  ├── commit() ──► allocations kept, TxnStatus::Committed returned
+  │
+  └── drop without commit ──► all allocations rewound, memory reused
+```
+
+`commit()` calls `mem::forget(self)` internally — the `Drop` impl is never invoked after a successful commit. Rollback after commit is structurally impossible.
+
+<Note>
+Each `alloc*` call returns `&mut T` that borrows the transaction. Do not hold references across subsequent allocations — use the value before calling `alloc` again.
+</Note>
+
+---
+
+## Lifecycle methods
+
+<ParamField path="commit" type="fn(self) -> TxnStatus">
+  Keep all allocations. Consumes the transaction guard. Returns `TxnStatus::Committed`.
+</ParamField>
+
+<ParamField path="rollback" type="fn(self) -> TxnStatus">
+  Explicit rollback. Equivalent to dropping the guard but communicates intent clearly. Returns `TxnStatus::RolledBack`.
+</ParamField>
+
+<ParamField path="savepoint" type="fn(&mut self) -> Transaction<'_>">
+  Open a nested transaction within this one. The child borrows the arena from the parent. Committing the child merges its allocations into the parent scope; dropping the child without committing rolls back only the child's work, leaving the parent untouched.
+</ParamField>
+
+```rust
+use fastarena::{Arena, TxnStatus};
+
+let mut arena = Arena::new();
+
+// commit
+let mut txn = arena.transaction();
+txn.alloc(42u32);
+let status = txn.commit();
+assert_eq!(status, TxnStatus::Committed);
+
+// rollback
+let mut txn = arena.transaction();
+txn.alloc(1u32);
+let status = txn.rollback();
+assert_eq!(status, TxnStatus::RolledBack);
+```
+
+---
+
+## Budget methods
+
+<ParamField path="set_limit" type="fn(&mut self, bytes: usize)">
+  Set a byte budget for this transaction. `alloc*` methods panic when exceeded; `try_alloc*` methods return `None`. Zero-cost when no limit is set.
+</ParamField>
+
+<ParamField path="budget_remaining" type="fn(&self) -> Option<usize>">
+  Bytes remaining in the budget, or `None` if no limit is set. Reflects arena bytes written via Transaction allocation methods.
+</ParamField>
+
+<Warning>
+Budget tracks `size_of::<T>()` (the inline struct footprint) only. Heap data inside values — `Vec` buffers, `String` heap data, `Box` contents — is **not** counted against the budget. To budget actual data bytes, use `alloc_slice`, `alloc_slice_copy`, or `alloc_str`.
+</Warning>
+
+```rust
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+let mut txn = arena.transaction();
+txn.set_limit(4096);  // hard cap
+
+// GOOD — alloc_slice copies data into arena; budget sees all bytes
+txn.alloc_slice(vec![0u8; 2048]);  // ok: 2048 arena bytes used
+
+// BAD — alloc(vec![...]) stores only the 24-byte Vec struct; heap is untracked
+// txn.alloc(vec![0u8; 9999]);     // would NOT panic — budget sees 24 bytes
+
+let remaining = txn.budget_remaining();  // Some(2048)
+txn.commit();
+```
+
+---
+
+## Introspection
+
+<ParamField path="bytes_used" type="fn(&self) -> usize">
+  Bytes allocated by this transaction since it opened. Includes all arena bytes written — both via Transaction methods and via `arena_mut()`. Includes alignment padding. O(1).
+</ParamField>
+
+<ParamField path="diff" type="fn(&self) -> TxnDiff">
+  Allocation metrics since this transaction opened. Returns a `TxnDiff` with `bytes_allocated` and `blocks_touched`. O(1).
+</ParamField>
+
+<ParamField path="depth" type="fn(&self) -> usize">
+  Nesting depth of this transaction: `1` = top-level, `2` = first savepoint, and so on.
+</ParamField>
+
+<ParamField path="arena_depth" type="fn(&self) -> usize">
+  Current nesting depth on the backing arena (total open transactions and savepoints).
+</ParamField>
+
+<ParamField path="checkpoint" type="fn(&self) -> Checkpoint">
+  The `Checkpoint` saved when this transaction opened. Useful for inspection or custom rewind logic.
+</ParamField>
+
+<ParamField path="is_committed" type="fn(&self) -> bool">
+  Returns `true` if `commit()` has been called on this guard.
+</ParamField>
+
+```rust
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+let mut txn = arena.transaction();
+
+// Zero bytes at open; blocks_touched is 1 (the current block)
+let diff = txn.diff();
+assert_eq!(diff.bytes_allocated, 0);
+assert_eq!(diff.blocks_touched, 1);
+
+txn.alloc(100u64);
+txn.alloc_slice(vec![0u8; 256]);
+
+let diff = txn.diff();
+println!("{diff}");  // e.g. "264 bytes in 1 block(s)"
+println!("depth: {}", txn.depth());       // 1
+println!("committed: {}", txn.is_committed()); // false
+
+txn.commit();
+```
+
+---
+
+## Arena access
+
+<ParamField path="arena_mut" type="fn(&mut self) -> &mut Arena">
+  Exclusive access to the backing arena. Use when you need to pass the arena to a helper that takes `&mut Arena` directly (e.g. constructing an `ArenaVec` inside a transaction).
+</ParamField>
+
+<Warning>
+Allocations made through the returned `&mut Arena` **bypass the transaction's budget**. They still participate in rollback, but their bytes are not pre-checked against `set_limit`. Budget tracking resumes once a Transaction allocation method is called.
+</Warning>
+
+```rust
+use fastarena::{Arena, ArenaVec};
+
+let mut arena = Arena::new();
+let mut txn = arena.transaction();
+
+// Construct ArenaVec inside the transaction
+let slice = {
+    let mut v = ArenaVec::new(txn.arena_mut());
+    v.extend_exact([1u32, 2, 3]);
+    v.finish()
+};
+
+txn.commit();  // slice survives
+assert_eq!(slice, &[1, 2, 3]);
+```
+
+---
+
+## Allocation methods
+
+`Transaction` exposes all the same allocation methods as `Arena`. All are budget-checked before delegating to the backing arena.
+
+**Infallible** (panic on budget exceeded or OOM):
+
+| Method | Signature |
+|---|---|
+| `alloc` | `fn alloc<T>(&mut self, val: T) -> &mut T` |
+| `alloc_slice` | `fn alloc_slice<T, I>(&mut self, iter: I) -> &mut [T]` |
+| `alloc_slice_copy` | `fn alloc_slice_copy<T: Copy>(&mut self, src: &[T]) -> &mut [T]` |
+| `alloc_str` | `fn alloc_str(&mut self, s: &str) -> &str` |
+| `alloc_uninit` | `fn alloc_uninit<T>(&mut self) -> &mut MaybeUninit<T>` |
+| `alloc_raw` | `fn alloc_raw(&mut self, size: usize, align: usize) -> NonNull<u8>` |
+| `alloc_zeroed` | `fn alloc_zeroed(&mut self, size: usize, align: usize) -> NonNull<u8>` |
+| `alloc_cache_aligned` | `fn alloc_cache_aligned(&mut self, size: usize) -> NonNull<u8>` |
+
+**Fallible** (return `None` on budget exceeded or OOM):
+
+| Method | Signature |
+|---|---|
+| `try_alloc` | `fn try_alloc<T>(&mut self, val: T) -> Option<&mut T>` |
+| `try_alloc_slice` | `fn try_alloc_slice<T, I>(&mut self, iter: I) -> Option<&mut [T]>` |
+| `try_alloc_slice_copy` | `fn try_alloc_slice_copy<T: Copy>(&mut self, src: &[T]) -> Option<&mut [T]>` |
+| `try_alloc_str` | `fn try_alloc_str(&mut self, s: &str) -> Option<&str>` |
+| `try_alloc_raw` | `fn try_alloc_raw(&mut self, size: usize, align: usize) -> Option<NonNull<u8>>` |
+| `try_alloc_cache_aligned` | `fn try_alloc_cache_aligned(&mut self, size: usize) -> Option<NonNull<u8>>` |
+
+<Note>
+`Transaction` does not have a `try_alloc_zeroed` method. For zeroed raw memory within a transaction, use `alloc_zeroed` (panics on budget exceeded) or call `txn.arena_mut().try_alloc_zeroed(size, align)` directly (bypasses budget).
+</Note>
+
+---
+
+## Usage patterns
+
+<Tabs>
+  <Tab title="Closure API (recommended)">
+    The closure API is the safest option. `Ok` commits; `Err` rolls back automatically before the result is returned.
+
+    ```rust
+    use fastarena::Arena;
+
+    let mut arena = Arena::new();
+
+    // Ok path — commits
+    let result = arena.with_transaction(|txn| -> Result<u32, &str> {
+        let x = txn.alloc(21u32);
+        Ok(*x * 2)
+    });
+    assert_eq!(result, Ok(42));
+
+    // Err path — rolls back all allocations made inside
+    let result = arena.with_transaction(|txn| -> Result<u32, &str> {
+        txn.alloc(1u32);
+        Err("fail")
+    });
+    assert!(result.is_err());
+    ```
+  </Tab>
+  <Tab title="Manual API">
+    Open and commit (or drop to roll back) the guard manually.
+
+    ```rust
+    use fastarena::Arena;
+
+    let mut arena = Arena::new();
+
+    let mut txn = arena.transaction();
+    txn.alloc(1u32);
+    txn.alloc(2u32);
+    txn.commit();  // keep both allocations
+
+    // Drop without commit — both allocations rolled back:
+    {
+        let mut txn = arena.transaction();
+        txn.alloc(99u32);
+    }  // txn dropped here → rewind
+    ```
+  </Tab>
+  <Tab title="Nested savepoints">
+    Savepoints nest to arbitrary depth. Each is independently committable.
+
+    ```rust
+    use fastarena::Arena;
+
+    let mut arena = Arena::new();
+    let mut outer = arena.transaction();
+    outer.alloc_str("top-level");
+
+    {
+        let mut inner = outer.savepoint();
+        inner.alloc_str("speculative");
+        inner.alloc(999u32);
+        // dropped without commit — inner work discarded, outer untouched
+    }
+
+    outer.alloc_str("confirmed");
+    outer.commit();  // "top-level" + "confirmed" survive
+    ```
+  </Tab>
+  <Tab title="Budget enforcement">
+    Cap arena bytes per transaction. `alloc*` panics on budget exceeded; `try_alloc*` returns `None`.
+
+    ```rust
+    use fastarena::Arena;
+
+    let mut arena = Arena::new();
+    let mut txn = arena.transaction();
+    txn.set_limit(1024);
+
+    txn.alloc_slice(vec![0u8; 512]);        // ok — 512 arena bytes used
+    // txn.alloc_slice(vec![0u8; 1024]);    // panics: budget exceeded
+
+    // Fallible variant — returns None instead of panicking
+    let result = txn.try_alloc_slice(vec![0u8; 1024]);
+    assert!(result.is_none());
+
+    txn.commit();
+    ```
+  </Tab>
+</Tabs>

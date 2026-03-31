@@ -1,0 +1,136 @@
+---
+title: "Feature flags"
+description: "Optional compile-time features for fastarena."
+---
+
+fastarena has zero required dependencies. Optional behavior is gated behind feature flags so you only pay for what you use.
+
+## Available features
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `drop-tracking` | Off | Run destructors in LIFO order on `reset()` / `rewind()` |
+
+---
+
+## `drop-tracking`
+
+### Enabling
+
+Add the feature to your `Cargo.toml`:
+
+```toml
+[dependencies]
+fastarena = { version = "0.1.3", features = ["drop-tracking"] }
+```
+
+The default (no feature) is:
+
+```toml
+[dependencies]
+fastarena = "0.1.3"
+```
+
+### What it does
+
+By default, fastarena **never runs destructors**. When you call `arena.reset()` or `arena.rewind(cp)`, memory is reclaimed instantly with a pointer reset — no iteration, no cleanup calls, zero overhead.
+
+With `drop-tracking` enabled, fastarena registers a destructor for every allocation that has a non-trivial `Drop` impl. When `reset()` or `rewind()` is called, all registered destructors for the affected memory range fire in **LIFO order** (last allocated, first dropped) before the memory is reclaimed.
+
+### LIFO ordering example
+
+```rust
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+let cp = arena.checkpoint();
+
+arena.alloc(String::from("hello"));
+arena.alloc(String::from("world"));
+
+// With drop-tracking: "world" drops first, then "hello"
+// Without drop-tracking: no destructors run, memory reclaimed instantly
+arena.rewind(cp);
+```
+
+### Behavior across all reclaim paths
+
+<CodeGroup>
+
+```rust reset() runs all destructors
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+arena.alloc(String::from("one"));
+arena.alloc(String::from("two"));
+arena.alloc(String::from("three"));
+
+// With drop-tracking: all three Strings drop in LIFO order
+arena.reset();
+```
+
+```rust Transaction rollback runs destructors
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+{
+    let mut txn = arena.transaction();
+    txn.alloc(String::from("rolled-back"));
+    txn.alloc(String::from("also-rolled-back"));
+    // drop without commit => rollback => destructors run
+}
+```
+
+```rust Committed txn defers drops to reset
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+{
+    let mut txn = arena.transaction();
+    txn.alloc(String::from("committed-string"));
+    let _ = txn.commit();
+}
+// Destructors NOT yet run — data is live in the arena
+arena.reset(); // NOW destructors run
+```
+
+```rust alloc_slice registers each element
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+let cp = arena.checkpoint();
+{
+    let items = (0..5).map(|i| format!("item-{i}"));
+    arena.alloc_slice(items); // each String registered individually
+}
+arena.rewind(cp);
+// With drop-tracking: all 5 Strings drop in LIFO order
+```
+
+</CodeGroup>
+
+### Performance
+
+<Tip>
+`drop-tracking` is zero-cost when disabled. Every code path gated on the feature is compiled out entirely — no branches, no metadata, no size overhead on allocations. If your data is purely POD (no meaningful `Drop` impl), you never need this feature.
+</Tip>
+
+| Scenario | Without feature | With feature |
+|----------|----------------|--------------|
+| `alloc` fast path | Unchanged | Registers destructor if `needs_drop::<T>()` |
+| `reset()` / `rewind()` | Pointer reset only | Run destructors, then pointer reset |
+| `ArenaBox` drop | No-op | No-op (destructor deferred to `reset`/`rewind`) |
+
+### When to use it
+
+**Use `drop-tracking` when** your types have meaningful destructors — types that manage heap memory (`String`, `Vec<T>`), file handles, network connections, locks, or any type with a custom `Drop` impl that performs real cleanup.
+
+<Warning>
+Without `drop-tracking`, destructors for types like `String` or `Vec` are **never called** when the arena is reset or rewound. If those types own heap memory, that memory leaks until the arena itself is dropped. Enable `drop-tracking` if this matters for your workload.
+</Warning>
+
+**Skip `drop-tracking` when** your arena holds purely POD data — `u32`, `f64`, `(usize, usize)`, `#[repr(C)]` structs with no heap fields. These have no `Drop` impl, so no destructors would fire anyway, and you pay nothing.
+
+<Note>
+`ArenaBox` does not run destructors on drop regardless of this feature. Destructors are deferred to the next `Arena::reset()` or `Arena::rewind()` call. If you drop an `ArenaBox` and never call `reset()`/`rewind()`, the destructor is never run even with `drop-tracking` enabled.
+</Note>

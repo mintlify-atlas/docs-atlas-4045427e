@@ -1,0 +1,200 @@
+---
+title: "Transactions"
+description: "RAII commit/rollback with closure API, manual transaction, and byte budget enforcement."
+---
+
+## What is a transaction?
+
+A `Transaction` is a RAII guard over an `Arena`. All allocations made through the guard are automatically rolled back when the guard is dropped — unless `commit()` is called first. This makes error handling simple: return an `Err` (or just let the guard go out of scope) and every allocation inside that scope disappears.
+
+<Warning>
+Each `alloc` call returns a `&mut T` that borrows the transaction. Do not hold a reference across subsequent allocation calls — the borrow checker will reject it. Consume or copy the value before calling `alloc` again. See the [borrow checker workarounds](/concepts/arena-basics#multiple-allocations-and-the-borrow-checker) for patterns to use instead.
+</Warning>
+
+## Closure API (recommended)
+
+The closure API handles commit and rollback without manual lifetime management.
+
+<CodeGroup>
+
+```rust with_transaction
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+
+// Ok commits; Err rolls back — all allocations are atomic.
+let result: Result<u32, &str> = arena.with_transaction(|txn| {
+    txn.alloc_str("fastarena");
+    let score = txn.alloc(100u32);
+    Ok(*score)
+});
+assert_eq!(result, Ok(100));
+
+// Failed transaction — everything allocated inside is rolled back.
+arena.with_transaction(|txn| {
+    txn.alloc(1u32);
+    txn.alloc(2u32);
+    Err("abort") // both u32s rolled back automatically
+});
+```
+
+```rust with_transaction_infallible
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+
+// Infallible variant — commits even if the closure panics.
+// The panic is re-raised after the commit. Use with_transaction for rollback-on-panic.
+let val = arena.with_transaction_infallible(|txn| {
+    *txn.alloc(7u32) * 6
+});
+assert_eq!(val, 42);
+```
+
+</CodeGroup>
+
+## Manual API
+
+Use `arena.transaction()` when you need the guard as a named variable.
+
+```rust
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+let mut txn = arena.transaction();
+txn.alloc(1u32);
+txn.alloc(2u32);
+txn.commit(); // or drop txn to roll back
+```
+
+Explicit rollback communicates intent:
+
+```rust
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+let mut txn = arena.transaction();
+txn.alloc(1u32);
+let status = txn.rollback(); // equivalent to dropping, but named
+// status == TxnStatus::RolledBack
+```
+
+## Transaction budget enforcement
+
+Set a hard byte cap on any transaction. Exceeding it causes `alloc*` to panic; `try_alloc*` returns `None` instead.
+
+```rust
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+let mut txn = arena.transaction();
+txn.set_limit(4096); // hard cap — 4096 bytes of arena memory
+
+// GOOD — alloc_slice copies data into arena; budget tracks all 2048 bytes.
+txn.alloc_slice(vec![0u8; 2048]); // ok
+
+// txn.alloc_slice(vec![0u8; 4096]);  // panics: budget exceeded (2048 + 4096 > 4096)
+txn.try_alloc_slice(vec![0u8; 4096]); // returns None instead of panicking
+
+let remaining = txn.budget_remaining(); // introspect at any time
+txn.commit();
+```
+
+<Warning>
+The budget tracks **inline sizes only** — the bytes written to arena blocks by the transaction's allocation methods. It checks `size_of::<T>()`. If you allocate a `Vec<u8>` or `String` value, only the 24-byte struct header is counted; the heap buffer those types allocate separately is invisible to the budget.
+
+```rust
+// BAD — budget sees 24 bytes (the Vec struct), not the heap data.
+txn.alloc(vec![0u8; 9999]); // would NOT panic with a 4096-byte limit
+
+// GOOD — budget sees all 4096 bytes (data lives directly in the arena).
+txn.alloc_slice(vec![0u8; 4096]);
+txn.alloc_slice_copy(&[0u8; 4096]);
+```
+</Warning>
+
+### Budget methods
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `set_limit` | `fn set_limit(&mut self, bytes: usize)` | Set byte cap |
+| `budget_remaining` | `fn budget_remaining(&self) -> Option<usize>` | Remaining budget, or `None` if unlimited |
+
+## Introspection
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `bytes_used` | `fn bytes_used(&self) -> usize` | Arena bytes allocated since this transaction opened |
+| `diff` | `fn diff(&self) -> TxnDiff` | Allocation metrics (bytes + blocks touched) |
+| `depth` | `fn depth(&self) -> usize` | Nesting depth: `1` = top-level, `2` = first savepoint, etc. |
+| `arena_depth` | `fn arena_depth(&self) -> usize` | Arena's current total nesting depth |
+| `checkpoint` | `fn checkpoint(&self) -> Checkpoint` | The checkpoint this transaction holds |
+| `is_committed` | `fn is_committed(&self) -> bool` | Whether `commit()` has been called |
+
+```rust
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+let mut txn = arena.transaction();
+
+txn.alloc(100u64);
+txn.alloc_slice(vec![0u8; 256]);
+
+let diff = txn.diff();
+assert!(diff.bytes_allocated >= 8);
+assert!(diff.blocks_touched >= 1);
+println!("{diff}"); // e.g. "264 bytes in 1 block(s)"
+
+txn.commit();
+```
+
+### `TxnDiff`
+
+`diff()` returns a `TxnDiff` with two fields:
+
+```rust
+pub struct TxnDiff {
+    pub bytes_allocated: usize, // bytes allocated since txn opened
+    pub blocks_touched: usize,  // blocks written to during txn
+}
+```
+
+`TxnDiff` is `Copy` and implements `Display`, printing as `"N bytes in M block(s)"`.
+
+## Direct arena access with `arena_mut()`
+
+`txn.arena_mut()` returns the backing `&mut Arena` directly. Allocations through it still participate in rollback but **bypass the budget pre-check**.
+
+```rust
+use fastarena::{Arena, ArenaVec};
+
+let mut arena = Arena::new();
+let mut txn = arena.transaction();
+txn.set_limit(1024);
+
+// ArenaVec requires &mut Arena — use arena_mut() to obtain one.
+// These bytes are NOT counted against the 1024-byte budget.
+let slice = {
+    let mut v = ArenaVec::new(txn.arena_mut());
+    v.extend_exact([1u32, 2, 3]);
+    v.finish()
+};
+txn.commit(); // slice survives
+```
+
+<Note>
+Budget tracking resumes once a Transaction allocation method (e.g. `txn.alloc(...)`) is called after `arena_mut()` use. Bytes written through `arena_mut()` are included in `bytes_used()` and `diff()` totals, but were not pre-checked against the limit.
+</Note>
+
+## All allocation methods on `Transaction`
+
+`Transaction` exposes the same allocation surface as `Arena` — all budget-checked:
+
+- `alloc`, `alloc_slice`, `alloc_slice_copy`, `alloc_str`, `alloc_uninit`, `alloc_raw`, `alloc_zeroed`, `alloc_cache_aligned`
+- `try_alloc`, `try_alloc_slice`, `try_alloc_slice_copy`, `try_alloc_str`, `try_alloc_raw`, `try_alloc_cache_aligned`
+
+The infallible variants panic when the budget is exceeded. The `try_*` variants return `None` instead.
+
+<Note>
+`Transaction` does not expose `try_alloc_zeroed`. For fallible zeroed allocation within a transaction, use `txn.arena_mut().try_alloc_zeroed(size, align)` — this bypasses the budget pre-check but still participates in rollback.
+</Note>

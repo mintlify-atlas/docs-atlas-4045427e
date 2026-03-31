@@ -1,0 +1,372 @@
+---
+title: "Use cases"
+description: "Common patterns where fastarena excels: compilers, graphs, servers, and more."
+---
+
+<CardGroup cols={2}>
+  <Card title="Compiler AST / parsers" icon="code">
+    Allocate all nodes per pass, reset in bulk. Heterogeneous types in a single arena with no per-node heap overhead.
+  </Card>
+  <Card title="Graphs and cyclic structures" icon="share-nodes">
+    Same-lifetime references enable safe cycles without `Rc`/`RefCell` or `unsafe` pointer tricks.
+  </Card>
+  <Card title="Trees with parent pointers" icon="diagram-project">
+    Back-references are trivially supported — all nodes share the arena's lifetime.
+  </Card>
+  <Card title="Request-scoped HTTP memory" icon="globe">
+    Thread-local arena per request. Reset at response time — zero-cost recycle, zero OS calls.
+  </Card>
+  <Card title="Transactional batch processing" icon="layer-group">
+    Commit on success, auto-rollback on failure. Nested savepoints for speculative work.
+  </Card>
+  <Card title="Dynamic collections" icon="list">
+    `ArenaVec` provides O(1) push with arena-backed lifetime and a `finish()` ownership transfer.
+  </Card>
+  <Card title="Phase-oriented bulk alloc/free" icon="arrows-rotate">
+    Many objects created during a phase, bulk-freed via `reset()` or `rewind()` — no per-object `free`.
+  </Card>
+</CardGroup>
+
+---
+
+## Compiler AST / parsers
+
+Compilers allocate many small, heterogeneous nodes (AST nodes, tokens, IR instructions) during each compilation pass and discard them all at once when the pass completes. An arena is the natural fit: allocate freely during the pass, `reset()` to reclaim everything in bulk.
+
+<Tabs>
+  <Tab title="Speculative optimization">
+
+```rust
+use fastarena::Arena;
+
+#[derive(Debug, PartialEq)]
+enum Op { Const(i64), Add, Mul, Nop }
+
+let mut arena = Arena::new();
+
+// Commit baseline IR nodes
+let _base = arena.with_transaction_infallible(|txn| {
+    let a = txn.alloc(Op::Const(10)) as *mut Op;
+    let b = txn.alloc(Op::Const(20)) as *mut Op;
+    let c = txn.alloc(Op::Add) as *mut Op;
+    (a, b, c)
+});
+let baseline = arena.stats().bytes_allocated;
+
+// Speculative optimization pass — discarded if not profitable
+{
+    let mut txn = arena.transaction();
+    for _ in 0..100 {
+        txn.alloc(Op::Nop);
+    }
+    // txn dropped without commit — speculative nodes gone
+}
+assert_eq!(arena.stats().bytes_allocated, baseline);
+
+// Apply real optimization
+arena.with_transaction(|txn| -> Result<(), ()> {
+    txn.alloc(Op::Mul);
+    Ok(())
+}).unwrap();
+```
+
+  </Tab>
+  <Tab title="Heterogeneous types">
+
+```rust
+use fastarena::Arena;
+
+// All node types allocated in a single arena — no separate allocators
+#[derive(Debug)] struct Token<'a> { text: &'a str }
+#[derive(Debug)] struct AstNode<'a> { kind: &'a str, token: *const Token<'a> }
+#[derive(Debug)] struct IrInstr { opcode: u32, operand: i64 }
+
+let mut arena = Arena::new();
+
+// Different types, same arena
+let tok = arena.alloc(Token { text: arena.alloc_str("fn") }) as *const Token;
+let node = arena.alloc(AstNode { kind: "FnDecl", token: tok });
+let instr = arena.alloc(IrInstr { opcode: 0x01, operand: 42 });
+
+// Bulk-free the entire parse result — one reset, no per-node free
+arena.reset();
+```
+
+  </Tab>
+</Tabs>
+
+<Note>
+  Heterogeneous allocation is a key advantage over `typed-arena`, which requires one arena per type. fastarena allocates any mix of types in a single arena.
+</Note>
+
+---
+
+## Graphs and cyclic structures
+
+Graph nodes that reference each other require a shared lifetime. With arena allocation, all nodes live as long as the arena — safe cycles become natural without reference counting or `unsafe` doubly-linked-list tricks.
+
+```rust
+use fastarena::Arena;
+
+struct Node<'a> {
+    value: i32,
+    neighbors: Vec<*const Node<'a>>, // raw pointers, same lifetime
+}
+
+let mut arena = Arena::new();
+
+// Allocate nodes — all share the arena's lifetime
+let a = arena.alloc(Node { value: 1, neighbors: vec![] }) as *mut Node;
+let b = arena.alloc(Node { value: 2, neighbors: vec![] }) as *mut Node;
+let c = arena.alloc(Node { value: 3, neighbors: vec![] }) as *mut Node;
+
+// Build edges — cycles are fine, all pointers valid until arena reset
+unsafe {
+    (*a).neighbors.push(b);
+    (*b).neighbors.push(c);
+    (*c).neighbors.push(a); // cycle: a -> b -> c -> a
+
+    println!("a.neighbors[0].value = {}", (*(*a).neighbors[0]).value); // 2
+}
+
+arena.reset(); // all nodes freed atomically
+```
+
+<Note>
+  When building graph structures, cast `alloc` results to raw pointers immediately to release the mutable borrow on the arena. All pointers remain valid until `reset()` or `rewind()` is called.
+</Note>
+
+---
+
+## Trees with parent pointers
+
+Back-references from child to parent are trivially supported — every node has the same lifetime (the arena's). No `Weak<T>`, no `RefCell`, no cycle detection needed.
+
+```rust
+use fastarena::Arena;
+
+struct TreeNode<'a> {
+    value: i32,
+    parent: Option<*const TreeNode<'a>>,
+    children: Vec<*const TreeNode<'a>>,
+}
+
+let mut arena = Arena::new();
+
+let root = arena.alloc(TreeNode {
+    value: 0,
+    parent: None,
+    children: vec![],
+}) as *mut TreeNode;
+
+let child = arena.alloc(TreeNode {
+    value: 1,
+    parent: Some(root as *const _), // parent pointer — safe within arena lifetime
+    children: vec![],
+}) as *const TreeNode;
+
+unsafe { (*root).children.push(child); }
+
+arena.reset(); // entire tree freed in one call
+```
+
+---
+
+## Request-scoped HTTP memory
+
+A thread-local arena gives each worker thread its own allocation region with no synchronization overhead. Reset at the end of each request — pages stay warm for the next one.
+
+<Tabs>
+  <Tab title="Thread-local pattern">
+
+```rust
+use fastarena::Arena;
+use std::cell::RefCell;
+
+thread_local! {
+    static ARENA: RefCell<Arena> = RefCell::new(Arena::with_capacity(64 * 1024));
+}
+
+fn handle_request(input: &[u8]) -> String {
+    ARENA.with(|cell| {
+        let mut arena = cell.borrow_mut();
+
+        // Allocate freely — no locks, no contention
+        let buf = arena.alloc_slice_copy(input);
+        let tag = arena.alloc_str("req-tag");
+        let result = process(buf, tag);
+
+        arena.reset(); // zero-cost recycle — pages stay warm
+        result
+    })
+}
+```
+
+  </Tab>
+  <Tab title="Budget-enforced per request (from real_world.rs)">
+
+```rust
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+let mut succeeded = 0u32;
+
+for round in 0u32..20 {
+    let ok = arena.with_transaction(|txn| -> Result<u32, &str> {
+        let id = *txn.alloc(round);
+        let tag = txn.alloc_str("req-tag");
+        let tag_len = tag.len() as u32;
+        let _ = txn.alloc_slice(0u8..16u8);
+
+        if round % 5 == 3 {
+            return Err("simulated failure"); // auto-rollback
+        }
+        Ok(id + tag_len)
+    });
+
+    if ok.is_ok() { succeeded += 1; }
+    arena.reset(); // recycle after each request
+}
+
+println!("{succeeded}/20 succeeded");
+```
+
+  </Tab>
+</Tabs>
+
+---
+
+## Transactional batch processing
+
+Use `with_transaction` to make batches atomic: either all entries commit, or none do. The LSM-tree pattern from `real_world.rs` demonstrates committing a batch of key-value entries and aborting on conflict.
+
+```rust
+use fastarena::Arena;
+
+#[derive(Debug)]
+struct KvEntry {
+    key_ptr: *const u8,
+    key_len: usize,
+    seq: u64,
+}
+
+let mut arena = Arena::new();
+
+// Committed batch — all entries land in the arena
+arena.with_transaction(|txn| -> Result<(), &str> {
+    let k1 = txn.alloc_str("apple") as *const str;
+    txn.alloc(KvEntry { key_ptr: k1 as *const u8, key_len: 5, seq: 1 });
+    let k2 = txn.alloc_str("banana") as *const str;
+    txn.alloc(KvEntry { key_ptr: k2 as *const u8, key_len: 6, seq: 2 });
+    Ok(())
+}).unwrap();
+
+let committed = arena.stats().bytes_allocated;
+
+// Aborted batch — duplicate key: no trace left in the arena
+let _ = arena.with_transaction(|txn| -> Result<(), &str> {
+    let k = txn.alloc_str("cherry") as *const str;
+    txn.alloc(KvEntry { key_ptr: k as *const u8, key_len: 6, seq: 3 });
+    Err("duplicate key") // auto-rollback: cherry entry gone
+});
+
+assert_eq!(arena.stats().bytes_allocated, committed);
+```
+
+---
+
+## Dynamic collections
+
+`ArenaVec` is a growable, append-only collection backed by arena memory. It supports O(1) amortized `push`, `extend`, `truncate`, `resize`, and a `finish()` method that hands the backing slice to the arena.
+
+<Tabs>
+  <Tab title="Build and freeze">
+
+```rust
+use fastarena::{Arena, ArenaVec};
+
+let mut arena = Arena::new();
+
+let items: &mut [u32] = {
+    let mut v = ArenaVec::new(&mut arena);
+    for i in 0..1024 {
+        v.push(i);
+    }
+    v.finish() // ArenaVec consumed — slice lives as long as arena
+};
+
+assert_eq!(items.len(), 1024);
+assert_eq!(items[512], 512);
+```
+
+  </Tab>
+  <Tab title="Inside a transaction">
+
+```rust
+use fastarena::{Arena, ArenaVec};
+
+let mut arena = Arena::new();
+
+{
+    let mut txn = arena.transaction();
+    let slice = {
+        let mut v = ArenaVec::new(txn.arena_mut());
+        v.extend_exact([1u32, 2, 3]);
+        v.finish()
+    };
+    assert_eq!(slice, &mut [1, 2, 3]);
+    txn.commit(); // slice survives
+}
+```
+
+  </Tab>
+  <Tab title="arenavec! macro">
+
+```rust
+use fastarena::{Arena, arenavec};
+
+let mut arena = Arena::new();
+
+// Literal list
+let vals: &mut [u32] = arenavec![in &mut arena; 10, 20, 30].finish();
+assert_eq!(vals, &mut [10, 20, 30]);
+
+// Repeated element (T: Clone)
+let zeroes: &mut [u8] = arenavec![in &mut arena; 0u8; 256].finish();
+assert_eq!(zeroes.len(), 256);
+```
+
+  </Tab>
+</Tabs>
+
+---
+
+## Phase-oriented bulk alloc/free
+
+Many workloads create a large number of objects during a "phase" (a parse pass, a rendering frame, a query evaluation) and then discard all of them at once. Arena allocation and bulk reset are a perfect match: allocate freely during the phase, call `reset()` or `rewind()` to reclaim everything in O(peak_blocks) time.
+
+```rust
+use fastarena::Arena;
+
+#[derive(Debug)]
+struct QueryResult<'a> {
+    rows: &'a mut [u64],
+    label: &'a str,
+}
+
+let mut arena = Arena::new();
+
+for frame in 0..100 {
+    // Phase: allocate freely
+    let rows = arena.alloc_slice(0u64..256);
+    let label = arena.alloc_str("query-result");
+    let _result = arena.alloc(QueryResult { rows, label });
+
+    // End of phase: bulk-free everything — O(1) for single-block arenas
+    arena.reset();
+}
+```
+
+<Tip>
+  Use `checkpoint()` + `rewind()` instead of `reset()` when you want to discard only the current phase's allocations while keeping earlier work. This is useful when phases are nested (e.g. an outer parse phase preserves results while an inner optimization phase is discarded on failure).
+</Tip>

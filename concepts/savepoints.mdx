@@ -1,0 +1,174 @@
+---
+title: "Nested savepoints"
+description: "Nest transactions to arbitrary depth — commit or roll back inner scopes independently."
+---
+
+## What are savepoints?
+
+A savepoint is a nested `Transaction` created from an existing `Transaction`. Each savepoint is independently committable: you can roll back an inner scope without losing any work done in the outer scope. Transactions nest to arbitrary depth.
+
+The key properties:
+
+- Dropping a savepoint without committing rolls back only its own allocations. The outer transaction and its allocations are untouched.
+- Committing a savepoint merges its allocations into the parent scope. They are now owned by the parent and survive until the parent itself commits or rolls back.
+- The parent transaction is inaccessible (borrowed) while a child savepoint is alive — the borrow checker enforces this statically.
+
+## Creating and using a savepoint
+
+```rust
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+let mut outer = arena.transaction();
+outer.alloc_str("top-level");
+
+{
+    let mut inner = outer.savepoint();
+    inner.alloc_str("speculative-opt");
+    inner.alloc(999u32);
+    // dropped without commit — inner work discarded, outer untouched
+}
+
+outer.alloc_str("confirmed");
+outer.commit(); // "top-level" + "confirmed" survive
+```
+
+## Depth tracking
+
+Two methods report nesting depth:
+
+| Method | Description |
+|--------|-------------|
+| `depth()` | Nesting depth of this transaction: `1` = top-level, `2` = first savepoint, `3` = second, etc. |
+| `arena_depth()` | Current total nesting depth on the backing arena — includes all open savepoints at any level. |
+
+## Three-level nesting example
+
+The following is taken directly from `examples/savepoints.rs`:
+
+<CodeGroup>
+
+```rust three levels
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+
+let mut t1 = arena.transaction();
+println!("depth after t1: {}", t1.arena_depth()); // 1
+
+t1.alloc(1u32);
+
+{
+    let mut t2 = t1.savepoint();
+    t2.alloc(2u32);
+    println!("t2 depth={}", t2.depth()); // 2
+
+    {
+        let mut t3 = t2.savepoint();
+        t3.alloc(3u32);
+        println!("t3 depth={}", t3.depth()); // 3
+        let _ = t3.commit();
+    }
+
+    println!("t2 arena_depth after t3 commit: {}", t2.arena_depth()); // 2
+    let _ = t2.commit();
+}
+
+println!("t1 arena_depth after t2 commit: {}", t1.arena_depth()); // 1
+let _ = t1.commit();
+
+println!("Final depth: {}", arena.transaction_depth()); // 0
+```
+
+```rust partial rollback
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+let mut outer = arena.transaction();
+outer.alloc(100u64);
+let after_outer = outer.bytes_used();
+
+{
+    let mut sp = outer.savepoint();
+    for _ in 0..25 {
+        sp.alloc(0u64);
+    }
+    // savepoint dropped — 25 allocations rolled back
+}
+
+// outer is unchanged: bytes_used() returns the same value as before
+assert_eq!(outer.bytes_used(), after_outer);
+println!("Savepoint rollback preserved parent: {} bytes", after_outer);
+let _ = outer.commit();
+```
+
+</CodeGroup>
+
+<Note>
+After `t3.commit()`, arena depth returns to 2. After `t2.commit()`, it returns to 1. After `t1.commit()`, `arena.transaction_depth()` returns 0. Depth bookkeeping is exact — there is no way to observe a committed transaction as still open.
+</Note>
+
+## How savepoints work
+
+<Steps>
+  <Step title="Open a savepoint">
+    Call `outer.savepoint()`. This creates a new `Transaction` that holds a checkpoint of the arena at the point of the call. The outer transaction is mutably borrowed for the lifetime of the inner one.
+
+    ```rust
+    let mut inner = outer.savepoint();
+    ```
+  </Step>
+  <Step title="Allocate inside the savepoint">
+    Use all the same allocation methods available on any transaction. Budget limits, if set on the inner transaction, apply independently of the outer transaction's budget.
+
+    ```rust
+    inner.alloc_str("speculative");
+    inner.alloc(42u32);
+    ```
+  </Step>
+  <Step title="Commit or discard">
+    Commit to merge the inner allocations into the outer scope. Drop without committing to discard them.
+
+    ```rust
+    // Merge into outer:
+    let _ = inner.commit();
+
+    // Or discard (equivalent to letting inner drop at end of block):
+    drop(inner);
+    ```
+  </Step>
+</Steps>
+
+## Partial rollback pattern
+
+Use a savepoint any time you need to attempt speculative work that may be abandoned:
+
+```rust
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+let mut outer = arena.transaction();
+
+// Stable work done unconditionally.
+outer.alloc_str("committed-header");
+
+let parse_ok = {
+    let mut sp = outer.savepoint();
+    let result = sp.alloc_str("parsed-body");
+    // Suppose parsing succeeded:
+    let success = true;
+    if success {
+        sp.commit();
+        true
+    } else {
+        false // sp drops here, rolling back "parsed-body"
+    }
+};
+
+if parse_ok {
+    outer.commit(); // "committed-header" + "parsed-body" survive
+} else {
+    // outer drops; only "committed-header" would have been kept,
+    // but we choose to roll back everything.
+}
+```

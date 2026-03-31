@@ -1,0 +1,66 @@
+---
+title: "Introduction"
+description: "fastarena — a zero-dependency bump-pointer arena allocator for Rust with RAII transactions, nested savepoints, ArenaVec, and optional drop tracking."
+---
+
+fastarena is a zero-dependency bump-pointer arena allocator for Rust. Instead of calling the global allocator for every object, you allocate from a single contiguous block of memory — pushing a pointer forward with each allocation. When you're done, you reset the pointer to zero and reuse all the memory without any OS calls or page faults.
+
+## The problem it solves
+
+Heap allocation via `Box` or `Vec` is expensive when you create thousands of short-lived objects in a tight loop. Each `malloc`/`free` pair carries OS overhead, TLB pressure, and cache misses from fragmented heap layouts. Other arena crates offer bump allocation but leave you with two unsolved problems:
+
+- **No safe rollback.** If your parser or query planner speculatively allocates nodes and then needs to discard them, other arenas give you no safe way to do that — you either leak the memory until the arena is destroyed or you drop the entire arena.
+- **Manual memory management complexity.** Grouping unrelated objects so they share a lifetime is error-prone, and there's no first-class primitive to express "these allocations are a unit that should commit or roll back together."
+
+fastarena solves both: `checkpoint()`/`rewind()` gives you O(1) save/restore points, and `with_transaction` gives you RAII commit/rollback with nesting support.
+
+## Key features
+
+| Feature | fastarena | bumpalo | typed-arena |
+|---------|-----------|---------|-------------|
+| O(1) bump allocation | Yes | Yes | Yes |
+| Heterogeneous types | Yes | Yes | No |
+| Checkpoint / Rewind | Yes (O(1) snapshot) | No | No |
+| RAII Transaction | Yes | No | No |
+| Nested Savepoints | Yes | No | No |
+| Transaction Budget | Yes | No | No |
+| Transaction Metrics | Yes (`TxnDiff`) | No | No |
+| `with_transaction` closure API | Yes | No | No |
+| `ArenaVec::finish()` ownership transfer | Yes | No | N/A |
+| Drop-tracking (opt-in) | Yes | No | Forced |
+| Fallible allocation | Yes | Partial | No |
+| `alloc_cache_aligned` | Yes | No | No |
+| O(1) stats with utilization | Yes | Partial | No |
+| `arenavec!` macro | Yes | No | No |
+| Zero dependencies | Yes | Yes | Yes |
+
+## Use cases
+
+**Compilers and parsers** — allocate all AST nodes for a parse pass, then call `reset()` in bulk. All pages stay mapped and TLB-warm for the next parse.
+
+**Graphs and cyclic structures** — objects allocated in the same arena share a lifetime, so back-references and parent pointers are safe without `Rc<RefCell<T>>`.
+
+**Request-scoped memory** — keep a thread-local arena per HTTP worker. After each request completes, call `reset()` and the arena is ready for the next one at zero allocation cost.
+
+**Transactional batch processing** — wrap speculative work in `with_transaction`. Return `Ok` to commit or `Err` to roll back. Nest savepoints for fine-grained control without manual cleanup.
+
+<Note>
+fastarena never runs destructors by default. If you allocate types with `Drop` implementations (like `String` or `Vec`), enable the `drop-tracking` feature to have them run in LIFO order on `reset()` / `rewind()`.
+</Note>
+
+## Explore fastarena
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="box" href="/installation">
+    Add fastarena to your Cargo.toml and configure feature flags.
+  </Card>
+  <Card title="Quick start" icon="rocket" href="/quickstart">
+    Your first allocation, transaction, and ArenaVec in minutes.
+  </Card>
+  <Card title="Arena basics" icon="book" href="/concepts/arena-basics">
+    How bump allocation, checkpoints, and reset work under the hood.
+  </Card>
+  <Card title="API reference" icon="code" href="/api/arena">
+    Full method signatures for Arena, Transaction, ArenaVec, and more.
+  </Card>
+</CardGroup>

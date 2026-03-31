@@ -1,0 +1,142 @@
+---
+title: "Transaction types"
+description: "TxnStatus, TxnDiff, and TryReserveError — auxiliary types for transaction introspection and error handling."
+---
+
+Three small supporting types round out the transaction and collection APIs: `TxnStatus` reports the outcome of a commit or rollback, `TxnDiff` captures per-transaction allocation metrics, and `TryReserveError` is the error type for fallible `ArenaVec` capacity operations.
+
+---
+
+## TxnStatus
+
+`TxnStatus` is the return value of `Transaction::commit()` and `Transaction::rollback()`. It tells you which path was actually taken.
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxnStatus {
+    Committed,
+    RolledBack,
+}
+```
+
+### Display
+
+| Variant | Display output |
+|---------|---------------|
+| `Committed` | `"committed"` |
+| `RolledBack` | `"rolled back"` |
+
+### Example
+
+```rust
+use fastarena::{Arena, TxnStatus};
+
+let mut arena = Arena::new();
+
+// commit() returns Committed
+let mut txn = arena.transaction();
+txn.alloc(42u32);
+let status = txn.commit();
+assert_eq!(status, TxnStatus::Committed);
+println!("{status}");  // "committed"
+
+// rollback() returns RolledBack
+let mut txn = arena.transaction();
+txn.alloc(1u32);
+let status = txn.rollback();
+assert_eq!(status, TxnStatus::RolledBack);
+println!("{status}");  // "rolled back"
+```
+
+---
+
+## TxnDiff
+
+`TxnDiff` reports how many bytes were allocated and how many blocks were touched within a single transaction scope. It is returned by `Transaction::diff()` and can be called at any point while the transaction is open.
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TxnDiff {
+    pub bytes_allocated: usize,  // bytes allocated since the transaction opened
+    pub blocks_touched: usize,   // number of blocks written to during the transaction
+}
+```
+
+### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `bytes_allocated` | `usize` | Total bytes allocated within this transaction scope since it was opened. |
+| `blocks_touched` | `usize` | Number of distinct arena blocks that received allocations during this transaction. Useful for detecting unexpected block chaining. |
+
+### Default
+
+`TxnDiff` implements `Default` — all fields are zero. `txn.diff()` immediately after opening a transaction returns the zero value.
+
+### Display
+
+Prints `"N bytes in M block(s)"`. For example: `"264 bytes in 1 block(s)"`.
+
+### Example
+
+```rust
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+let mut txn = arena.transaction();
+
+// Zero bytes at open; blocks_touched starts at 1 (the active block)
+let diff = txn.diff();
+assert_eq!(diff.bytes_allocated, 0);
+assert_eq!(diff.blocks_touched, 1);
+
+txn.alloc(100u64);
+txn.alloc_slice(vec![0u8; 256]);
+
+let diff = txn.diff();
+assert!(diff.bytes_allocated > 0);
+assert!(diff.blocks_touched >= 1);
+println!("{diff}");  // e.g. "264 bytes in 1 block(s)"
+
+txn.commit();
+```
+
+---
+
+## TryReserveError
+
+`TryReserveError` is returned by `ArenaVec::try_reserve` and `ArenaVec::try_reserve_exact` when a fallible capacity reservation fails.
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TryReserveError {
+    CapacityOverflow,  // requested size exceeds usize::MAX
+    AllocError,        // arena is out of memory
+}
+```
+
+### Variants
+
+| Variant | Meaning |
+|---------|---------|
+| `CapacityOverflow` | The requested capacity, after accounting for existing elements, would exceed `usize::MAX`. |
+| `AllocError` | The arena could not satisfy the allocation (out of memory). |
+
+### Trait implementations
+
+`TryReserveError` implements `Display` and `std::error::Error`, so it can be used directly with `?` in functions that return `Box<dyn Error>` or similar.
+
+### Example
+
+```rust
+use fastarena::{Arena, ArenaVec, TryReserveError};
+
+let mut arena = Arena::with_capacity(64);
+let mut v: ArenaVec<u8> = ArenaVec::new(&mut arena);
+
+match v.try_reserve_exact(usize::MAX) {
+    Ok(()) => unreachable!(),
+    Err(TryReserveError::CapacityOverflow) => println!("overflow"),
+    Err(TryReserveError::AllocError) => println!("oom"),
+}
+```

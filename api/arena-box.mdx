@@ -1,0 +1,124 @@
+---
+title: "ArenaBox"
+description: "An owned allocation from the arena, similar to Box<T> but backed by arena memory."
+---
+
+`ArenaBox<'arena, T>` provides ownership semantics for arena-allocated values — without touching the heap. Where `Box<T>` calls the global allocator, `ArenaBox<T>` places its data directly inside the arena's bump-pointer memory, giving you move semantics, `Deref`/`DerefMut`, and a familiar `Box`-like API at arena speed.
+
+## Construction
+
+Use `Arena::alloc_box` to create an `ArenaBox`:
+
+```rust
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+let b = arena.alloc_box(42i32);  // ArenaBox<'_, i32>
+```
+
+The returned type is `ArenaBox<'arena, T>`, where `'arena` is the lifetime of the arena borrow.
+
+## Methods
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `into_inner` | `fn into_inner(self) -> T` | Consume the `ArenaBox` and extract the inner value |
+| `as_ptr` | `fn as_ptr(&self) -> *const T` | Raw const pointer to the data |
+| `as_mut_ptr` | `fn as_mut_ptr(&mut self) -> *mut T` | Raw mutable pointer to the data |
+
+```rust
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+let b = arena.alloc_box(99u64);
+
+// Raw pointer access
+let p: *const u64 = b.as_ptr();
+assert_eq!(unsafe { *p }, 99);
+
+// Consume and extract
+let val: u64 = b.into_inner();
+assert_eq!(val, 99);
+```
+
+## Deref and DerefMut
+
+`ArenaBox<T>` implements both `Deref<Target = T>` and `DerefMut`, so you can use it exactly like a `&T` or `&mut T`:
+
+<CodeGroup>
+
+```rust Read through deref
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+let b = arena.alloc_box(42i32);
+
+assert_eq!(*b, 42);          // Deref
+println!("{b}");             // Display — uses inner value's Display
+```
+
+```rust Modify through DerefMut
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+let mut b = arena.alloc_box(42i32);
+
+*b = 100;                    // DerefMut
+assert_eq!(*b, 100);
+```
+
+</CodeGroup>
+
+## Additional trait implementations
+
+`ArenaBox<T>` implements:
+
+| Trait | Condition | Notes |
+|-------|-----------|-------|
+| `Deref<Target = T>` | Always | Read through the box |
+| `DerefMut` | Always | Write through the box |
+| `Debug` | `T: Debug` | Forwards to inner value |
+| `Display` | `T: Display` | Forwards to inner value |
+| `Pointer` | Always | Prints the raw pointer address |
+| `Send` | Unconditional | Explicitly implemented via `unsafe impl` |
+| `Sync` | Unconditional | Explicitly implemented via `unsafe impl` |
+
+<Note>
+`Send` and `Sync` are explicitly implemented for `ArenaBox<T>` regardless of whether `T: Send` or `T: Sync`. This reflects that `ArenaBox` itself is a thin pointer wrapper with no interior mutability. If your `T` is not safe to send across threads, you must enforce that at a higher level.
+</Note>
+
+## Lifetime and arena safety
+
+<Note>
+The lifetime `'arena` in `ArenaBox<'arena, T>` ties the box to the arena it was allocated from. As long as an `ArenaBox` is live, you cannot call methods that require `&mut Arena` (such as further allocations) because the borrow checker prevents re-borrowing.
+</Note>
+
+<Warning>
+The lifetime bound is a borrow-checker hint, **not a full compile-time guarantee**. If you convert the `ArenaBox` to a raw pointer or use unsafe code to extend its lifetime, calling `arena.reset()` or `arena.rewind(cp)` while the `ArenaBox` data is still in use will leave a dangling pointer and cause undefined behavior.
+
+```rust
+// UNSAFE — do not do this
+let b = arena.alloc_box(42i32);
+let p: *const i32 = b.as_ptr();
+drop(b);
+arena.reset();
+// *p is now UB — memory has been reclaimed
+```
+</Warning>
+
+## Destructors are not run on drop
+
+When an `ArenaBox` is dropped normally (goes out of scope), **no destructor is run on the inner value**. The arena simply reclaims the memory on the next `reset()` or `rewind()`, with no cleanup.
+
+If you need destructors to fire, enable the [`drop-tracking`](/api/feature-flags) feature. With that feature active, destructors are registered at allocation time and run in LIFO order when `Arena::reset()` or `Arena::rewind()` is called.
+
+```rust
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+let b = arena.alloc_box(String::from("hello"));
+
+// Without drop-tracking: String::drop() is never called — memory leaks
+// With    drop-tracking: String::drop() runs on arena.reset() / arena.rewind()
+drop(b);
+```

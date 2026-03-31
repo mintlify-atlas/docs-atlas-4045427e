@@ -1,0 +1,342 @@
+---
+title: "ArenaVec"
+description: "A growable vector backed by arena memory with O(1) push and ownership transfer via finish()."
+---
+
+## What is ArenaVec?
+
+`ArenaVec<T>` is an append-only growable vector backed by arena memory. It works like `Vec<T>` for building collections, but all capacity is allocated from an `Arena` rather than the global heap. The key differentiator is `finish()`: once you are done pushing, call `finish()` to transfer ownership to the arena. The vector is consumed with no destructor call and no copy, and the returned slice lives as long as the arena.
+
+## Construction
+
+<Tabs>
+  <Tab title="Empty">
+    ```rust
+    use fastarena::{Arena, ArenaVec};
+
+    let mut arena = Arena::new();
+    let v: ArenaVec<u32> = ArenaVec::new(&mut arena);
+    assert!(v.is_empty());
+    ```
+  </Tab>
+  <Tab title="With capacity">
+    ```rust
+    use fastarena::{Arena, ArenaVec};
+
+    let mut arena = Arena::new();
+    // Pre-allocate for 32 elements — no reallocation if you push ≤ 32 items.
+    let mut v = ArenaVec::<u64>::with_capacity(&mut arena, 32);
+    assert_eq!(v.capacity(), 32);
+
+    for i in 0u64..32 { v.push(i); }
+    assert_eq!(v.capacity(), 32); // no reallocation occurred
+    ```
+  </Tab>
+</Tabs>
+
+## Core operations
+
+### Push and pop
+
+```rust
+use fastarena::{Arena, ArenaVec};
+
+let mut arena = Arena::new();
+let mut v = ArenaVec::new(&mut arena);
+
+v.push(1u32);
+v.push(2);
+v.push(3);
+assert_eq!(v.pop(), Some(3));
+assert_eq!(v.pop(), Some(2));
+assert_eq!(v.len(), 1);
+```
+
+`push` is amortised O(1). `try_push` is the fallible variant — it returns `Result<(), T>`, giving the value back on OOM.
+
+### Batch operations
+
+```rust
+use fastarena::{Arena, ArenaVec};
+
+let mut arena = Arena::new();
+let mut v = ArenaVec::new(&mut arena);
+
+// From any ExactSizeIterator:
+v.extend_exact([10u64, 20, 30, 40, 50]);
+assert_eq!(v.as_slice(), &[10, 20, 30, 40, 50]);
+
+// Single memcpy for Copy types:
+let mut v2 = ArenaVec::new(&mut arena);
+v2.extend_from_slice(&[100u32, 200, 300]);
+assert_eq!(v2.as_slice(), &[100, 200, 300]);
+```
+
+### Truncate and resize
+
+```rust
+use fastarena::{Arena, ArenaVec};
+
+let mut arena = Arena::new();
+let mut v = ArenaVec::new(&mut arena);
+v.extend_exact([1u32, 2, 3, 4, 5]);
+
+v.truncate(3);    // [1, 2, 3] — elements 4, 5 are dropped
+v.resize(6, 0);   // [1, 2, 3, 0, 0, 0] — fills with clone
+v.resize(2, 0);   // [1, 2] — excess dropped
+```
+
+### Clear
+
+```rust
+use fastarena::{Arena, ArenaVec};
+
+let mut arena = Arena::new();
+let mut v = ArenaVec::new(&mut arena);
+v.extend_exact([1u32, 2, 3]);
+v.clear(); // element destructors run; capacity is retained
+assert!(v.is_empty());
+```
+
+## Capacity management
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `reserve` | `fn reserve(&mut self, additional: usize)` | Ensure at least `additional` more slots; may over-allocate |
+| `reserve_exact` | `fn reserve_exact(&mut self, additional: usize)` | Reserve exactly `additional` more slots |
+| `try_reserve` | `fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError>` | Fallible reserve |
+| `try_reserve_exact` | `fn try_reserve_exact(&mut self, additional: usize) -> Result<(), TryReserveError>` | Fallible exact reserve |
+| `capacity` | `fn capacity(&self) -> usize` | Total slots currently allocated |
+
+```rust
+use fastarena::{Arena, ArenaVec};
+
+let mut arena = Arena::new();
+let mut v = ArenaVec::<u32>::new(&mut arena);
+v.reserve(100);
+println!("after reserve(100): cap={}", v.capacity());
+assert!(v.try_reserve(1000).is_ok());
+```
+
+## Introspection
+
+| Method | Signature |
+|--------|-----------|
+| `len` | `fn len(&self) -> usize` |
+| `is_empty` | `fn is_empty(&self) -> bool` |
+| `as_slice` | `fn as_slice(&self) -> &[T]` |
+| `as_mut_slice` | `fn as_mut_slice(&mut self) -> &mut [T]` |
+
+## The `finish()` semantic
+
+`finish()` is the key differentiator from `bumpalo::collections::Vec`. It consumes the `ArenaVec` without running any destructor and returns a `&'arena mut [T]` — a slice whose lifetime is tied to the arena, not the vector.
+
+```rust
+use fastarena::{Arena, ArenaVec};
+
+let mut arena = Arena::new();
+
+// finish() — ArenaVec consumed, no destructor runs, arena owns the data.
+let slice: &mut [u32] = {
+    let mut v = ArenaVec::new(&mut arena);
+    v.push(1); v.push(2); v.push(3);
+    v.finish()
+}; // slice lives as long as the arena
+
+assert_eq!(slice, &mut [1, 2, 3]);
+```
+
+Contrast this with dropping without `finish()`:
+
+```rust
+use fastarena::{Arena, ArenaVec};
+
+let mut arena = Arena::new();
+
+// drop without finish() — element destructors run immediately; arena retains backing memory.
+{
+    let mut v = ArenaVec::new(&mut arena);
+    v.push(String::from("hello"));
+} // String::drop() fires here; the arena block is not freed
+```
+
+<Tip>
+Use `finish()` when you are building a collection in one phase and reading it in another. The resulting slice has arena lifetime and requires no additional bookkeeping.
+</Tip>
+
+<Note>
+The full build-and-freeze example from the examples file:
+
+```rust
+use fastarena::{Arena, ArenaVec};
+
+let mut arena = Arena::new();
+
+let items: &mut [u32] = {
+    let mut v = ArenaVec::new(&mut arena);
+    for i in 0..1024 {
+        v.push(i);
+    }
+    v.finish() // ArenaVec consumed, slice now arena-owned
+};
+
+assert_eq!(items.len(), 1024);
+assert_eq!(items[512], 512);
+```
+</Note>
+
+## ArenaVec inside transactions
+
+Use `txn.arena_mut()` to obtain a `&mut Arena` for constructing an `ArenaVec` within a transaction scope. Allocations participate in rollback normally.
+
+```rust
+use fastarena::{Arena, ArenaVec};
+
+let mut arena = Arena::new();
+let mut txn = arena.transaction();
+
+let slice = {
+    let mut v = ArenaVec::new(txn.arena_mut());
+    v.extend_exact([1u32, 2, 3]);
+    v.finish()
+};
+
+txn.commit(); // slice survives; rolling back would reclaim its memory
+```
+
+From the `examples/arena_vec.rs` example:
+
+```rust
+use fastarena::{Arena, ArenaVec};
+
+let mut arena = Arena::new();
+
+{
+    let mut txn = arena.transaction();
+    let _slice = {
+        let mut v = ArenaVec::new(txn.arena_mut());
+        v.extend_exact([1u32, 2, 3]);
+        v.finish()
+    };
+    let _ = txn.commit();
+    println!("ArenaVec in txn committed");
+}
+```
+
+## `arenavec!` macro
+
+The `arenavec!` macro provides concise `ArenaVec` construction. The arena reference always follows the `in` keyword.
+
+<Tabs>
+  <Tab title="Empty">
+    ```rust
+    use fastarena::{Arena, ArenaVec, arenavec};
+
+    let mut arena = Arena::new();
+    let v: ArenaVec<u32> = arenavec![in &mut arena];
+    assert!(v.is_empty());
+    ```
+  </Tab>
+  <Tab title="List">
+    ```rust
+    use fastarena::{Arena, arenavec};
+
+    let mut arena = Arena::new();
+    let v = arenavec![in &mut arena; 1u32, 2, 3];
+    assert_eq!(v.as_slice(), &[1, 2, 3]);
+    ```
+  </Tab>
+  <Tab title="Repeat">
+    ```rust
+    // Requires T: Clone
+    use fastarena::{Arena, arenavec};
+
+    let mut arena = Arena::new();
+    let v = arenavec![in &mut arena; 0u32; 10];
+    assert_eq!(v.len(), 10);
+    assert_eq!(v.as_slice(), &[0; 10]);
+    ```
+  </Tab>
+  <Tab title="With finish()">
+    ```rust
+    use fastarena::{Arena, arenavec};
+
+    let mut arena = Arena::new();
+    let slice = arenavec![in &mut arena; 1u32, 2, 3].finish();
+    assert_eq!(slice, &mut [1, 2, 3]);
+
+    // Repeat form with finish():
+    let items: &mut [u32] = arenavec![in &mut arena; 0u32; 1024].finish();
+    assert_eq!(items[512], 0);
+    ```
+  </Tab>
+  <Tab title="In a transaction">
+    ```rust
+    use fastarena::{Arena, arenavec};
+
+    let mut arena = Arena::new();
+    let mut txn = arena.transaction();
+    {
+        let v = arenavec![in txn.arena_mut(); 10u32, 20, 30];
+        assert_eq!(v.as_slice(), &[10, 20, 30]);
+    }
+    txn.commit();
+    ```
+  </Tab>
+</Tabs>
+
+## Trait implementations
+
+`ArenaVec<T>` implements:
+
+- `Index<usize>` and `IndexMut<usize>` — element access by index
+- `Extend<T>` — standard extend from any iterator
+- `IntoIterator` — owned (`for x in vec`), `&` (shared), and `&mut` (mutable) iteration
+- `ExactSizeIterator` — via `ArenaVecIntoIter`
+
+```rust
+use fastarena::{Arena, ArenaVec};
+
+let mut arena = Arena::new();
+
+// IndexMut
+let mut v = ArenaVec::new(&mut arena);
+v.push(10u32);
+v.push(20);
+v[0] = 99;
+assert_eq!(v[0], 99);
+```
+
+## `ArenaVecIntoIter`
+
+`ArenaVec::into_iter()` returns an `ArenaVecIntoIter<'arena, T>` — an owning iterator that drains elements front-to-back. Remaining elements are dropped in LIFO order when the iterator is dropped.
+
+```rust
+use fastarena::{Arena, ArenaVec};
+
+let mut arena = Arena::new();
+let v: ArenaVec<u32> = {
+    let mut v = ArenaVec::new(&mut arena);
+    v.extend_exact([10, 20, 30, 40, 50]);
+    v
+};
+
+let mut collected = Vec::new();
+for val in v {
+    collected.push(val);
+}
+assert_eq!(collected, vec![10, 20, 30, 40, 50]);
+```
+
+`ArenaVecIntoIter` implements `ExactSizeIterator` — `size_hint()` and `len()` are exact:
+
+```rust
+use fastarena::{Arena, ArenaVec};
+
+let mut arena = Arena::new();
+let mut v = ArenaVec::new(&mut arena);
+v.extend_exact([1u32, 2, 3]);
+let iter = v.into_iter();
+assert_eq!(iter.size_hint(), (3, Some(3)));
+assert_eq!(iter.len(), 3);
+```

@@ -1,0 +1,362 @@
+---
+title: "Arena"
+description: "The main bump-pointer allocator. Provides O(1) allocation, checkpoints, rewind, reset, and transaction management."
+---
+
+`Arena` is the root type of the fastarena crate. All allocation, checkpoint, rewind, reset, and transaction operations originate here. The arena owns one or more contiguous memory blocks and advances a bump pointer for each allocation.
+
+<Note>
+All `alloc*` methods take `&mut self` and return `&mut T`. The borrow checker statically prevents `rewind` or `reset` while any live reference exists — there is no runtime cost for this guarantee.
+</Note>
+
+## Constructors
+
+<ParamField path="Arena::new" type="fn() -> Arena">
+  Creates an arena with a 64 KiB initial block. Suitable for most per-request workloads.
+</ParamField>
+
+<ParamField path="Arena::with_capacity" type="fn(bytes: usize) -> Arena">
+  Creates an arena with a custom initial block size. Choose a value close to expected peak usage to avoid early block chaining.
+</ParamField>
+
+```rust
+use fastarena::Arena;
+
+let arena = Arena::new();
+let arena = Arena::with_capacity(1024 * 1024); // 1 MiB initial block
+```
+
+<Tip>
+Pre-allocating with `with_capacity` avoids early block chaining and keeps all data in a single warm page for cache-friendly access patterns.
+</Tip>
+
+---
+
+## Allocation methods
+
+All infallible allocation methods panic on OOM. For fallible variants see [Fallible allocation](#fallible-allocation) below.
+
+| Method | Signature | Description |
+|---|---|---|
+| `alloc` | `fn alloc<T>(&mut self, val: T) -> &mut T` | O(1) single value |
+| `alloc_box` | `fn alloc_box<T>(&mut self, val: T) -> ArenaBox<'_, T>` | Owned allocation (`Box`-like) |
+| `alloc_slice` | `fn alloc_slice<T, I>(&mut self, iter: I) -> &mut [T]` | From `ExactSizeIterator` |
+| `alloc_slice_copy` | `fn alloc_slice_copy<T: Copy>(&mut self, src: &[T]) -> &mut [T]` | Single `memcpy` for `Copy` types |
+| `alloc_str` | `fn alloc_str(&mut self, s: &str) -> &str` | Copy string into arena |
+| `alloc_uninit` | `fn alloc_uninit<T>(&mut self) -> &mut MaybeUninit<T>` | Uninitialized slot |
+| `alloc_raw` | `fn alloc_raw(&mut self, size: usize, align: usize) -> NonNull<u8>` | Raw bytes with alignment |
+| `alloc_zeroed` | `fn alloc_zeroed(&mut self, size: usize, align: usize) -> NonNull<u8>` | Zeroed raw bytes |
+| `alloc_cache_aligned` | `fn alloc_cache_aligned(&mut self, size: usize) -> NonNull<u8>` | 64-byte aligned (SIMD-friendly) |
+
+<CodeGroup>
+
+```rust alloc / alloc_str
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+
+let x: &mut u64 = arena.alloc(42);
+assert_eq!(*x, 42);
+*x = 100;
+
+let s: &str = arena.alloc_str("hello world");
+assert_eq!(s, "hello world");
+```
+
+```rust alloc_slice / alloc_slice_copy
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+
+// From any ExactSizeIterator
+let squares: &mut [u32] = arena.alloc_slice(0u32..5);
+assert_eq!(squares, &[0, 1, 2, 3, 4]);
+
+// Single memcpy for Copy types — faster for bulk data
+let src: &[u64] = &[1, 2, 3, 4];
+let dst: &mut [u64] = arena.alloc_slice_copy(src);
+assert_eq!(dst, &[1, 2, 3, 4]);
+```
+
+```rust alloc_uninit
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+
+let slot = arena.alloc_uninit::<u64>();
+slot.write(42);
+let val: &u64 = unsafe { slot.assume_init_ref() };
+assert_eq!(*val, 42);
+```
+
+```rust alloc_raw / alloc_zeroed / alloc_cache_aligned
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+
+// Page-aligned raw bytes
+let raw = arena.alloc_raw(4096, 4096);
+assert_eq!(raw.as_ptr() as usize % 4096, 0);
+
+// Zeroed raw bytes
+let zeroed = arena.alloc_zeroed(32, 8);
+let buf = unsafe { std::slice::from_raw_parts(zeroed.as_ptr(), 32) };
+assert!(buf.iter().all(|&b| b == 0));
+
+// 64-byte cache-line aligned (SIMD-friendly)
+let aligned = arena.alloc_cache_aligned(128);
+assert_eq!(aligned.as_ptr() as usize % 64, 0);
+```
+
+</CodeGroup>
+
+<Note>
+Without the `drop-tracking` feature, destructors for arena-allocated values are **never called**. Memory is reclaimed in bulk by `reset()` or when the arena is dropped. Enable `drop-tracking` to opt in to LIFO destructor execution on `reset` / `rewind`.
+</Note>
+
+### Multiple allocations and the borrow checker
+
+All `alloc*` methods return `&mut T`, which borrows the arena mutably. You cannot hold two such references simultaneously:
+
+```rust
+// This does NOT compile:
+let mut arena = Arena::new();
+let x = arena.alloc(1i32);  // &mut i32 — arena mutably borrowed
+let y = arena.alloc(2i32);  // ERROR: cannot borrow arena as mutable more than once
+```
+
+**Workarounds:**
+
+<Tabs>
+  <Tab title="Immediate consumption">
+    ```rust
+    use fastarena::Arena;
+
+    let mut arena = Arena::new();
+    let x = arena.alloc(1i32);
+    let sum = *x + 10;  // consume x before next alloc
+    let y = arena.alloc(sum);
+    ```
+  </Tab>
+  <Tab title="Raw pointer">
+    ```rust
+    use fastarena::Arena;
+
+    let mut arena = Arena::new();
+    let x: *mut i32 = arena.alloc(1i32) as *mut _;
+    let y = arena.alloc(2i32);
+    // x and y are independent raw pointers
+    ```
+  </Tab>
+  <Tab title="ArenaVec (same type)">
+    ```rust
+    use fastarena::{Arena, ArenaVec};
+
+    let mut arena = Arena::new();
+    let mut v = ArenaVec::new(&mut arena);
+    v.push(1);
+    v.push(2);
+    let slice: &mut [i32] = v.finish();
+    ```
+  </Tab>
+  <Tab title="ArenaBox">
+    ```rust
+    use fastarena::Arena;
+
+    let mut arena = Arena::new();
+    let x = arena.alloc_box(1i32);
+    assert_eq!(*x, 1);
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Fallible allocation
+
+Every allocation method has a `try_*` variant that returns `Option<_>` instead of panicking on OOM.
+
+| Method | Signature |
+|---|---|
+| `try_alloc` | `fn try_alloc<T>(&mut self, val: T) -> Option<&mut T>` |
+| `try_alloc_slice` | `fn try_alloc_slice<T, I>(&mut self, iter: I) -> Option<&mut [T]>` |
+| `try_alloc_slice_copy` | `fn try_alloc_slice_copy<T: Copy>(&mut self, src: &[T]) -> Option<&mut [T]>` |
+| `try_alloc_str` | `fn try_alloc_str(&mut self, s: &str) -> Option<&str>` |
+| `try_alloc_raw` | `fn try_alloc_raw(&mut self, size: usize, align: usize) -> Option<NonNull<u8>>` |
+| `try_alloc_zeroed` | `fn try_alloc_zeroed(&mut self, size: usize, align: usize) -> Option<NonNull<u8>>` |
+| `try_alloc_cache_aligned` | `fn try_alloc_cache_aligned(&mut self, size: usize) -> Option<NonNull<u8>>` |
+
+```rust
+use fastarena::Arena;
+
+let mut arena = Arena::with_capacity(64);
+
+match arena.try_alloc(42u64) {
+    Some(val) => println!("allocated: {}", val),
+    None      => println!("out of memory"),
+}
+
+// Fallible slice
+let s = arena.try_alloc_str("hello");
+assert_eq!(s, Some("hello"));
+
+// Fallible raw
+let ptr = arena.try_alloc_raw(128, 64);
+assert!(ptr.is_some());
+assert_eq!(ptr.unwrap().as_ptr() as usize % 64, 0);
+```
+
+---
+
+## Checkpoint, rewind, and reset
+
+| Method | Signature | Complexity | Description |
+|---|---|---|---|
+| `checkpoint` | `fn checkpoint(&self) -> Checkpoint` | O(1) | Snapshot current position |
+| `rewind` | `fn rewind(&mut self, cp: Checkpoint)` | O(k) | Roll back to checkpoint |
+| `reset` | `fn reset(&mut self)` | O(p) | Reset entire arena |
+
+**`checkpoint()`** copies 3 integers — zero-cost to take and to pass around. `Checkpoint` implements `Copy`.
+
+**`rewind(cp)`** complexity is O(k) where k is the number of blocks opened since the checkpoint was taken — typically 0 or 1. Blocks are retained and their offsets reset to zero for immediate reuse; no OS calls are made.
+
+**`reset()`** complexity is O(p) where p is the peak block count since the last reset. A `high_water_mark` tracks the highest block index ever reached. On reset, only blocks `0..=high_water_mark` have their offsets zeroed — all capacity is fully reusable with no waste. Single-block arenas pay O(1). No memory is freed.
+
+```rust
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+arena.alloc(1u64);
+
+let cp = arena.checkpoint();       // O(1) — copies 3 integers
+arena.alloc(2u64);
+arena.alloc(3u64);
+arena.rewind(cp);                  // 2 and 3 gone; blocks retained for reuse
+assert_eq!(arena.stats().bytes_allocated, 8);
+
+// Checkpoint is Copy — pass freely
+let cp2 = arena.checkpoint();
+let cp3 = cp2;                     // free copy
+arena.alloc(4u64);
+arena.rewind(cp3);                 // 4 gone
+
+// Reset — reclaims all memory for reuse, O(peak_blocks)
+arena.reset();
+assert_eq!(arena.stats().bytes_allocated, 0);
+```
+
+<Tip>
+In server request loops, prefer `reset()` over dropping and recreating the arena. OS pages stay mapped and TLB-warm; subsequent allocations hit the fast path immediately.
+
+```rust
+let mut arena = Arena::new();
+for batch in batches {
+    process(&mut arena, batch);
+    arena.reset();  // warm pages, no OS calls
+}
+```
+</Tip>
+
+---
+
+## Transaction methods
+
+| Method | Signature | Description |
+|---|---|---|
+| `transaction` | `fn transaction(&mut self) -> Transaction<'_>` | Open a manual RAII transaction |
+| `with_transaction` | `fn with_transaction<F, T, E>(&mut self, f: F) -> Result<T, E>` | `Ok` commits, `Err` rolls back |
+| `with_transaction_infallible` | `fn with_transaction_infallible<F, T>(&mut self, f: F) -> T` | Always commits, even through panic |
+| `transaction_depth` | `fn transaction_depth(&self) -> usize` | Current nesting depth |
+
+```rust
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+
+// Closure API — recommended
+let result: Result<u32, &str> = arena.with_transaction(|txn| {
+    let score = txn.alloc(100u32);
+    Ok(*score)
+});
+assert_eq!(result, Ok(100));
+
+// Err rolls back all allocations made inside
+arena.with_transaction(|txn| {
+    txn.alloc(1u32);
+    txn.alloc(2u32);
+    Err("abort")  // both u32s rolled back automatically
+});
+
+// Infallible — commits even through panic
+let val = arena.with_transaction_infallible(|txn| {
+    *txn.alloc(7u32) * 6
+});
+assert_eq!(val, 42);
+
+// Manual API
+let mut txn = arena.transaction();
+txn.alloc(1u32);
+txn.alloc(2u32);
+txn.commit();  // or drop to rollback
+
+assert_eq!(arena.transaction_depth(), 0);
+```
+
+See [Transaction](/api/transaction) for the full transaction API including savepoints and budgets.
+
+---
+
+## Introspection
+
+| Method | Signature | Complexity | Description |
+|---|---|---|---|
+| `stats` | `fn stats(&self) -> ArenaStats` | O(1) | Memory usage snapshot |
+| `block_count` | `fn block_count(&self) -> usize` | O(1) | Number of blocks owned |
+
+```rust
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+for _ in 0..100 {
+    let _ = arena.alloc(0u64);
+}
+
+let stats = arena.stats();
+println!("{:.1}% utilized", stats.utilization() * 100.0);
+println!("{} bytes allocated", stats.bytes_allocated);
+println!("{} bytes reserved", stats.bytes_reserved);
+println!("{} bytes idle", stats.bytes_idle());
+println!("{} blocks", arena.block_count());
+```
+
+See [ArenaStats](/api/arena-stats) for the full field and method reference.
+
+---
+
+## Drop-tracking registration
+
+When the `drop-tracking` feature is enabled, `alloc` and `alloc_slice` automatically register destructors. For manually initialized memory (from `alloc_uninit` or `alloc_raw`), you must register the destructor yourself:
+
+```rust
+// Only available with drop-tracking feature enabled
+pub unsafe fn register_drop<T>(&mut self, ptr: *mut T)
+```
+
+**Safety:** `ptr` must point to a fully initialized `T` allocated from this arena. Calling `register_drop` twice for the same pointer causes a double-drop. This method is a no-op when the `drop-tracking` feature is disabled — safe to call unconditionally with no effect.
+
+See [drop-tracking](/api/feature-flags) for full details.
+
+---
+
+## Debug
+
+`Arena` implements `Debug`. The output includes `bytes_allocated`, `bytes_reserved`, `block_count`, and `txn_depth`:
+
+```rust
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+arena.alloc(42u64);
+println!("{:?}", arena);
+// Arena { bytes_allocated: 8, bytes_reserved: 65536, block_count: 1, txn_depth: 0 }
+```

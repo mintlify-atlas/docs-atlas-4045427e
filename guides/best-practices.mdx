@@ -1,0 +1,292 @@
+---
+title: "Best practices"
+description: "Proven patterns for using fastarena effectively in production workloads."
+---
+
+<AccordionGroup>
+
+  <Accordion title="1. Pre-allocate for known workloads">
+    If you know roughly how much memory a workload needs, pass that size to `Arena::with_capacity`. This reserves a single block upfront and avoids early block chaining — which would otherwise require allocating new OS pages mid-run.
+
+    <CodeGroup>
+
+    ```rust avoid block chaining
+    use fastarena::Arena;
+
+    // 1 MiB initial block — no chaining for workloads that fit inside
+    let mut arena = Arena::with_capacity(1024 * 1024);
+
+    // All allocations land in the initial block: no extra OS calls
+    for i in 0u32..10_000 {
+        arena.alloc(i);
+    }
+    ```
+
+    ```rust default capacity
+    use fastarena::Arena;
+
+    // Default: 64 KiB initial block — fine for small workloads
+    let mut arena = Arena::new();
+    ```
+
+    </CodeGroup>
+
+    <Tip>
+      Check `arena.stats()` after a representative workload run to see `bytes_allocated` and tune your initial capacity accordingly.
+    </Tip>
+  </Accordion>
+
+  <Accordion title="2. Reset over recreate">
+    Dropping and re-creating an arena on each iteration frees OS pages and re-allocates them next time — paying page-fault costs every cycle. Calling `reset()` instead zeros only the blocks that were actually used (tracked via an internal `high_water_mark`), leaving all pages mapped and TLB-warm.
+
+    <CodeGroup>
+
+    ```rust good — reset in a loop
+    use fastarena::Arena;
+
+    let mut arena = Arena::new();
+
+    for batch in batches {
+        process(&mut arena, batch);
+        arena.reset(); // O(peak_blocks) — warm pages, no OS calls
+    }
+    ```
+
+    ```rust bad — recreate each iteration
+    for batch in batches {
+        let mut arena = Arena::new(); // new OS allocation every iteration
+        process(&mut arena, batch);
+        // arena dropped here — pages freed
+    }
+    ```
+
+    </CodeGroup>
+
+    <Note>
+      `reset()` complexity is O(p) where p is the peak block count since the last reset. Single-block arenas pay O(1). All memory is fully reusable with zero waste.
+    </Note>
+  </Accordion>
+
+  <Accordion title="3. Use transactions for fallible operations">
+    Wrap any work that might fail in `with_transaction`. If the closure returns `Err`, all allocations inside are automatically rolled back. No manual cleanup needed, no leaked memory, no partial state.
+
+    <CodeGroup>
+
+    ```rust with_transaction closure
+    use fastarena::Arena;
+
+    let mut arena = Arena::new();
+
+    let result = arena.with_transaction(|txn| {
+        let parsed = parse(txn, input)?;   // ? rolls back on Err
+        let optimized = optimize(txn, parsed)?;
+        Ok(optimized)
+    }); // auto-rollback on any Err
+    ```
+
+    ```rust nested savepoints
+    use fastarena::Arena;
+
+    let mut arena = Arena::new();
+    let mut outer = arena.transaction();
+    outer.alloc_str("top-level");
+
+    {
+        let mut inner = outer.savepoint();
+        inner.alloc_str("speculative-opt");
+        inner.alloc(999u32);
+        // dropped without commit — inner work discarded, outer untouched
+    }
+
+    outer.alloc_str("confirmed");
+    outer.commit(); // "top-level" + "confirmed" survive
+    ```
+
+    </CodeGroup>
+
+    <Tip>
+      Use `with_transaction_infallible` when the closure cannot fail — it commits even through a panic.
+    </Tip>
+  </Accordion>
+
+  <Accordion title="4. Use finish() when building then freezing">
+    `ArenaVec` is a growable builder. Call `finish()` when you are done pushing elements to hand ownership of the backing memory to the arena. No destructor is run on the vec, no copy occurs, and the resulting slice lives as long as the arena.
+
+    <CodeGroup>
+
+    ```rust build then freeze with finish()
+    use fastarena::{Arena, ArenaVec};
+
+    let mut arena = Arena::new();
+
+    let items: &mut [u32] = {
+        let mut v = ArenaVec::new(&mut arena);
+        for i in 0..1024 {
+            v.push(compute(i));
+        }
+        v.finish() // ArenaVec consumed, slice now arena-owned
+    };
+
+    assert_eq!(items.len(), 1024);
+    ```
+
+    ```rust arenavec! macro shorthand
+    use fastarena::{Arena, arenavec};
+
+    let mut arena = Arena::new();
+
+    // Concise construction + freeze in one expression
+    let values: &mut [u32] = arenavec![in &mut arena; 1, 2, 3].finish();
+    assert_eq!(values, &mut [1, 2, 3]);
+
+    // Repeated element (T: Clone)
+    let zeroes: &mut [u32] = arenavec![in &mut arena; 0u32; 256].finish();
+    assert_eq!(zeroes.len(), 256);
+    ```
+
+    </CodeGroup>
+
+    <Note>
+      Dropping an `ArenaVec` without calling `finish()` runs element destructors immediately. The arena retains the backing memory, but any `Drop` impls fire at the drop site.
+    </Note>
+  </Accordion>
+
+  <Accordion title="5. Set budgets in server contexts">
+    In HTTP or RPC servers, a misbehaving handler that allocates unboundedly can exhaust the arena. Set a per-request budget with `set_limit` to enforce a hard cap. Exceed it and `alloc` panics; use `try_alloc` variants for graceful `None` returns instead.
+
+    <CodeGroup>
+
+    ```rust per-request budget
+    use fastarena::Arena;
+
+    let mut arena = Arena::new();
+
+    let mut txn = arena.transaction();
+    txn.set_limit(64 * 1024); // 64 KiB per request
+
+    handle_request(&mut txn);
+
+    let remaining = txn.budget_remaining(); // introspect if needed
+    txn.commit();
+    ```
+
+    ```rust graceful budget exhaustion
+    use fastarena::Arena;
+
+    let mut arena = Arena::new();
+    let mut txn = arena.transaction();
+    txn.set_limit(4096);
+
+    // Panicking variant
+    txn.alloc_slice(vec![0u8; 2048]); // ok — 2048 bytes used
+
+    // Graceful variant — returns None when budget would be exceeded
+    let result = txn.try_alloc_slice(vec![0u8; 4096]);
+    assert!(result.is_none()); // 2048 + 4096 > 4096
+
+    txn.commit();
+    ```
+
+    </CodeGroup>
+
+    <Warning>
+      `alloc(some_vec)` stores only the 24-byte `Vec` struct in the arena — the heap buffer is **not** tracked. Use `alloc_slice` or `alloc_slice_copy` to count the actual data bytes against the budget.
+    </Warning>
+  </Accordion>
+
+  <Accordion title="6. Use checkpoint/rewind for speculative work">
+    Take an O(1) checkpoint snapshot, attempt speculative work, then rewind if it fails. This is lighter than a full transaction when you do not need RAII rollback semantics.
+
+    <CodeGroup>
+
+    ```rust speculative optimization pass
+    use fastarena::Arena;
+
+    let mut arena = Arena::new();
+    arena.alloc(1u64); // baseline work
+
+    let cp = arena.checkpoint(); // O(1) — copies 3 integers
+
+    // Speculative: try an expensive transformation
+    arena.alloc(2u64);
+    arena.alloc(3u64);
+
+    let success = try_optimization(&mut arena);
+
+    if !success {
+        arena.rewind(cp); // undo speculative allocations, keep baseline
+    }
+    ```
+
+    ```rust compiler example from real_world.rs
+    use fastarena::Arena;
+
+    #[derive(Debug)]
+    enum Op { Const(i64), Add, Mul, Nop }
+
+    let mut arena = Arena::new();
+
+    // Commit baseline nodes
+    let _base = arena.with_transaction_infallible(|txn| {
+        let a = txn.alloc(Op::Const(10)) as *mut Op;
+        let b = txn.alloc(Op::Const(20)) as *mut Op;
+        let c = txn.alloc(Op::Add) as *mut Op;
+        (a, b, c)
+    });
+    let baseline = arena.stats().bytes_allocated;
+
+    // Speculative pass — discarded if not profitable
+    {
+        let mut txn = arena.transaction();
+        for _ in 0..100 {
+            txn.alloc(Op::Nop);
+        }
+        // txn dropped without commit — all Nop nodes gone
+    }
+    assert_eq!(arena.stats().bytes_allocated, baseline);
+    ```
+
+    </CodeGroup>
+
+    <Tip>
+      `Checkpoint` is `Copy`, so you can store and pass it freely with zero overhead.
+    </Tip>
+  </Accordion>
+
+  <Accordion title="7. Prefer alloc_slice_copy for Copy types">
+    For types that implement `Copy`, `alloc_slice_copy` issues a single `memcpy` from a source slice into the arena. Compared to `alloc_slice` with an iterator, it skips per-element write overhead and avoids iterator machinery entirely.
+
+    <CodeGroup>
+
+    ```rust alloc_slice_copy — single memcpy
+    use fastarena::Arena;
+
+    let mut arena = Arena::new();
+
+    let src: Vec<u32> = (0..4096).collect();
+
+    // Single memcpy — fastest path for Copy types
+    let copied: &mut [u32] = arena.alloc_slice_copy(&src);
+    assert_eq!(copied.len(), 4096);
+    assert_eq!(copied[512], 512);
+    ```
+
+    ```rust alloc_slice — iterator path
+    use fastarena::Arena;
+
+    let mut arena = Arena::new();
+
+    // Works for non-Copy types and ExactSizeIterator sources;
+    // slower for Copy types due to per-element write
+    let squares: &mut [u32] = arena.alloc_slice(0u32..64);
+    assert_eq!(squares.len(), 64);
+    ```
+
+    </CodeGroup>
+
+    <Note>
+      `alloc_slice_copy` requires `T: Copy`. For non-`Copy` types or when constructing values on the fly, use `alloc_slice` with an `ExactSizeIterator` instead.
+    </Note>
+  </Accordion>
+
+</AccordionGroup>

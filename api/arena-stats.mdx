@@ -1,0 +1,131 @@
+---
+title: "ArenaStats"
+description: "O(1) memory usage snapshot returned by Arena::stats()."
+---
+
+`ArenaStats` is a plain struct snapshot of the arena's memory state. All three counters are maintained incrementally by the arena, so `Arena::stats()` is always O(1) — there is no block scan or iteration.
+
+```rust
+pub struct ArenaStats {
+    pub bytes_allocated: usize,  // in-use bytes
+    pub bytes_reserved: usize,   // total reserved across all blocks
+    pub block_count: usize,      // number of blocks
+}
+```
+
+## Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `bytes_allocated` | `usize` | Bytes committed to live allocations, including alignment padding. Decremented by `rewind()` and zeroed by `reset()`. |
+| `bytes_reserved` | `usize` | Total bytes reserved across all owned blocks. Only ever grows — blocks are retained across rewinds and resets, so this reflects peak capacity. Always `>= bytes_allocated`. |
+| `block_count` | `usize` | Number of blocks owned by the arena, including idle blocks retained for reuse after a rewind or reset. |
+
+## Methods
+
+### `utilization() -> f64`
+
+Returns `bytes_allocated / bytes_reserved` as a value in `[0.0, 1.0]`. Returns `0.0` when the arena is empty (avoids divide-by-zero).
+
+### `bytes_idle() -> usize`
+
+Returns `bytes_reserved - bytes_allocated` — the number of reserved bytes not currently in use. This capacity is immediately available for future allocations without any new block allocation.
+
+## Display
+
+`ArenaStats` implements `Display` with the format:
+
+```
+{bytes_allocated} allocated / {bytes_reserved} reserved ({block_count} blocks, {util:.1}% util)
+```
+
+For example: `800 allocated / 65536 reserved (1 blocks, 1.2% util)`
+
+## Usage
+
+```rust
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+
+let s = arena.stats();
+println!("{s}");
+// e.g. "0 allocated / 65536 reserved (1 blocks, 0.0% util)"
+
+for i in 0u64..100 {
+    arena.alloc(i);
+}
+
+let s = arena.stats();
+println!("{:.1}% utilized", s.utilization() * 100.0);
+println!("{} bytes idle", s.bytes_idle());
+println!("blocks: {}", s.block_count);
+```
+
+## Stats after reset — reserved memory is retained
+
+A key property: `reset()` zeroes `bytes_allocated` but **does not change `bytes_reserved`**. Pages stay mapped and warm, ready for immediate reuse:
+
+```rust
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+for _ in 0..50 {
+    arena.alloc(0u64);
+}
+let before = arena.stats();
+arena.reset();
+let after = arena.stats();
+
+assert_eq!(after.bytes_allocated, 0);
+assert_eq!(after.bytes_reserved, before.bytes_reserved); // capacity retained
+println!("reset: reserved kept? {}", after.bytes_reserved > 0); // true
+```
+
+## Stats across multiple blocks
+
+When the arena grows beyond its initial block, `block_count` and `bytes_reserved` reflect the total across all blocks:
+
+```rust
+use fastarena::Arena;
+
+// Small initial capacity forces block growth
+let mut arena = Arena::with_capacity(64);
+for _ in 0..100 {
+    arena.alloc(0u64);
+}
+let s = arena.stats();
+println!(
+    "small arena, 100 u64s: blocks={}, reserved={}, allocated={}",
+    s.block_count, s.bytes_reserved, s.bytes_allocated
+);
+// blocks > 1, bytes_reserved >> bytes_allocated (reserved grows 1.5x per block)
+```
+
+## `arena.block_count()` shortcut
+
+`Arena::block_count()` is a direct O(1) shortcut that returns the same value as `arena.stats().block_count`, without constructing a full `ArenaStats`:
+
+```rust
+let count = arena.block_count();  // equivalent to arena.stats().block_count
+```
+
+## Stats with transactions (`TxnDiff`)
+
+For per-transaction allocation metrics, use `txn.diff()` which returns a [`TxnDiff`](/api/txn-types) rather than a full `ArenaStats`:
+
+```rust
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+let mut txn = arena.transaction();
+txn.alloc(1u64);
+txn.alloc(2u64);
+
+println!(
+    "txn diff: bytes={}, blocks={}",
+    txn.diff().bytes_allocated,
+    txn.diff().blocks_touched
+);
+let _ = txn.commit();
+```

@@ -1,0 +1,223 @@
+---
+title: "Arena basics"
+description: "Understand bump-pointer allocation, checkpoints, rewind, and zero-cost reset."
+---
+
+## How bump-pointer allocation works
+
+An arena allocator maintains a single pointer into a pre-allocated memory block. Every allocation does exactly two things:
+
+1. Checks that the current pointer plus the requested size fits within the block boundary.
+2. Advances the pointer past the new allocation and returns a reference to the just-claimed region.
+
+Both steps are O(1). There is no per-object bookkeeping, no free-list traversal, and no lock. When the current block is exhausted, a new block is allocated from the OS and becomes the active block — O(1) amortised.
+
+```rust
+// Under the hood, every alloc does roughly:
+//   if cur_ptr + size <= cur_end { ptr = cur_ptr; cur_ptr += size; return ptr; }
+//   else { slow_path() }
+```
+
+## Creating an arena
+
+<CodeGroup>
+
+```rust 64 KiB default
+use fastarena::Arena;
+
+// Allocates a 64 KiB initial block — sufficient for most per-request workloads.
+let mut arena = Arena::new();
+```
+
+```rust custom capacity
+use fastarena::Arena;
+
+// Pre-allocate 1 MiB to avoid block chaining in larger workloads.
+let mut arena = Arena::with_capacity(1024 * 1024);
+assert_eq!(arena.stats().bytes_reserved, 1024 * 1024);
+```
+
+</CodeGroup>
+
+<Tip>
+Pre-allocate close to your expected peak usage. A single large block avoids the overhead of chaining multiple blocks and keeps all allocations in one contiguous region.
+</Tip>
+
+## Allocation methods
+
+### Infallible (panics on OOM)
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `alloc` | `fn alloc<T>(&mut self, val: T) -> &mut T` | O(1) single value |
+| `alloc_box` | `fn alloc_box<T>(&mut self, val: T) -> ArenaBox<'_, T>` | Owned allocation (`Box`-like) |
+| `alloc_slice` | `fn alloc_slice<T, I>(&mut self, iter: I) -> &mut [T]` | From `ExactSizeIterator` |
+| `alloc_slice_copy` | `fn alloc_slice_copy<T: Copy>(&mut self, src: &[T]) -> &mut [T]` | Single `memcpy` for `Copy` types |
+| `alloc_str` | `fn alloc_str(&mut self, s: &str) -> &str` | Copy string into arena |
+| `alloc_uninit` | `fn alloc_uninit<T>(&mut self) -> &mut MaybeUninit<T>` | Uninitialized slot |
+| `alloc_raw` | `fn alloc_raw(&mut self, size: usize, align: usize) -> NonNull<u8>` | Raw bytes with alignment |
+| `alloc_zeroed` | `fn alloc_zeroed(&mut self, size: usize, align: usize) -> NonNull<u8>` | Zeroed raw bytes |
+| `alloc_cache_aligned` | `fn alloc_cache_aligned(&mut self, size: usize) -> NonNull<u8>` | 64-byte aligned (SIMD-friendly) |
+
+```rust
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+
+let p = arena.alloc(Point { x: 1.0, y: 2.0 });
+let slice = arena.alloc_slice(0u32..100);
+let s = arena.alloc_str("hello");
+let raw = arena.alloc_raw(4096, 4096);    // page-aligned raw bytes
+let buf = arena.alloc_cache_aligned(256); // 64-byte cache-line aligned
+```
+
+### Fallible variants (return `Option`)
+
+All allocation methods have `try_*` counterparts that return `Option` instead of panicking when memory is unavailable.
+
+| Method | Signature |
+|--------|-----------|
+| `try_alloc` | `fn try_alloc<T>(&mut self, val: T) -> Option<&mut T>` |
+| `try_alloc_slice` | `fn try_alloc_slice<T, I>(&mut self, iter: I) -> Option<&mut [T]>` |
+| `try_alloc_slice_copy` | `fn try_alloc_slice_copy<T: Copy>(&mut self, src: &[T]) -> Option<&mut [T]>` |
+| `try_alloc_str` | `fn try_alloc_str(&mut self, s: &str) -> Option<&str>` |
+| `try_alloc_raw` | `fn try_alloc_raw(&mut self, size: usize, align: usize) -> Option<NonNull<u8>>` |
+| `try_alloc_zeroed` | `fn try_alloc_zeroed(&mut self, size: usize, align: usize) -> Option<NonNull<u8>>` |
+| `try_alloc_cache_aligned` | `fn try_alloc_cache_aligned(&mut self, size: usize) -> Option<NonNull<u8>>` |
+
+```rust
+use fastarena::Arena;
+
+// Arena with a tiny block to demonstrate OOM behaviour.
+let mut arena = Arena::with_capacity(64);
+match arena.try_alloc(42u64) {
+    Some(val) => { /* success */ }
+    None => { /* out of memory */ }
+}
+```
+
+## Checkpoint, rewind, and reset
+
+### Complexity
+
+| Method | Signature | Complexity | Description |
+|--------|-----------|------------|-------------|
+| `checkpoint` | `fn checkpoint(&self) -> Checkpoint` | O(1) | Snapshot current position |
+| `rewind` | `fn rewind(&mut self, cp: Checkpoint)` | O(k) | Roll back to checkpoint |
+| `reset` | `fn reset(&mut self)` | O(p) | Reset entire arena |
+
+`checkpoint()` copies three integers — it has no allocation overhead. `rewind(cp)` zeroes the offsets of any blocks opened after the checkpoint; k is the number of such blocks (typically 0 or 1). `reset()` is O(p) where p is the peak block count since the last reset — only blocks that were actually used have their offsets zeroed. Single-block arenas pay O(1). No memory is ever freed: OS pages stay mapped and TLB-warm.
+
+<Tabs>
+  <Tab title="checkpoint / rewind">
+    ```rust
+    use fastarena::Arena;
+
+    let mut arena = Arena::new();
+    arena.alloc(1u64);
+
+    let cp = arena.checkpoint();   // O(1) — copies 3 integers
+    arena.alloc(2u64);
+    arena.alloc(3u64);
+    arena.rewind(cp);              // 2 and 3 gone; blocks retained for reuse
+
+    assert_eq!(arena.stats().bytes_allocated, 8);
+    ```
+  </Tab>
+  <Tab title="reset">
+    ```rust
+    use fastarena::Arena;
+
+    let mut arena = Arena::new();
+    for _ in 0..100 { let _ = arena.alloc(0u64); }
+    arena.reset();
+    assert_eq!(arena.stats().bytes_allocated, 0);
+    // Pages stay warm — the next batch costs no OS calls.
+    ```
+  </Tab>
+  <Tab title="speculative work">
+    ```rust
+    use fastarena::Arena;
+
+    let mut arena = Arena::new();
+    arena.alloc(1u64);
+
+    let cp = arena.checkpoint();
+
+    // Attempt some work that may fail.
+    let success = false;
+    arena.alloc(2u64);
+    arena.alloc(3u64);
+
+    if !success {
+        arena.rewind(cp); // undo speculative allocations, keep original
+    }
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+`Checkpoint` is `Copy` — pass it freely without cost. It implements `Display` and prints as `Checkpoint(block=N, offset=N, bytes=N)`. A checkpoint must only be passed back to the arena that produced it.
+</Note>
+
+## Multiple allocations and the borrow checker
+
+All `alloc*` methods return `&mut T`, which mutably borrows the arena. Holding one reference while calling another allocation method does not compile:
+
+```rust ignore
+// This does NOT compile:
+let mut arena = Arena::new();
+let x = arena.alloc(1i32);  // &mut i32
+let y = arena.alloc(2i32);  // ERROR: cannot borrow arena as mutable more than once
+```
+
+Four practical workarounds:
+
+<Steps>
+  <Step title="Immediate consumption">
+    Transform the value before allocating again.
+
+    ```rust
+    let mut arena = Arena::new();
+    let x = arena.alloc(1i32);
+    let sum = *x + 10;  // consume x
+    let y = arena.alloc(sum);
+    ```
+  </Step>
+  <Step title="Store as raw pointer">
+    Convert the reference to a raw pointer after allocation.
+
+    ```rust
+    use fastarena::Arena;
+
+    let mut arena = Arena::new();
+    let x: *mut i32 = arena.alloc(1i32) as *mut _;
+    let y = arena.alloc(2i32);
+    // use x and y independently
+    ```
+  </Step>
+  <Step title="Use ArenaVec">
+    Collect multiple items of the same type without conflicting borrows.
+
+    ```rust
+    use fastarena::{Arena, ArenaVec};
+
+    let mut arena = Arena::new();
+    let mut vec = ArenaVec::new(&mut arena);
+    vec.push(1);
+    vec.push(2);
+    let slice = vec.finish(); // &mut [i32]
+    ```
+  </Step>
+  <Step title="Use ArenaBox">
+    Get ownership semantics — the box can be moved or dropped independently.
+
+    ```rust
+    use fastarena::{Arena, ArenaBox};
+
+    let mut arena = Arena::new();
+    let x = arena.alloc_box(1i32);
+    assert_eq!(*x, 1);
+    ```
+  </Step>
+</Steps>

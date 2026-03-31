@@ -1,0 +1,128 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "fastarena",
+  "projectDescription": "A zero-dependency bump-pointer arena allocator for Rust with RAII transactions, nested savepoints, ArenaVec, and optional drop tracking.",
+  "theme": "luma",
+  "primaryColor": "#7c7c7c",
+  "lightColor": "#121212",
+  "darkColor": "#c9c9c9",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/arena-basics",
+              "concepts/transactions",
+              "concepts/savepoints",
+              "concepts/arena-vec"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/best-practices",
+              "guides/performance",
+              "guides/safety",
+              "guides/use-cases"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core Types",
+            "pages": [
+              "api/arena",
+              "api/transaction",
+              "api/arena-vec"
+            ]
+          },
+          {
+            "group": "Supporting Types",
+            "pages": [
+              "api/arena-box",
+              "api/checkpoint",
+              "api/arena-stats",
+              "api/txn-types"
+            ]
+          },
+          {
+            "group": "Feature Flags",
+            "pages": [
+              "api/feature-flags"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "O(1) bump-pointer allocation with single bounds check",
+    "RAII transactions with auto-rollback on drop",
+    "Nested savepoints to arbitrary depth",
+    "ArenaVec growable vector backed by arena memory",
+    "Zero-cost reset — pages stay mapped, no OS calls",
+    "Transaction budget enforcement for request-scoped safety",
+    "Optional LIFO drop-tracking via feature flag",
+    "ArenaBox owned allocation without heap",
+    "Fallible allocation variants returning Option",
+    "Zero external dependencies"
+  ],
+  "publicApiSurface": [
+    "Arena",
+    "Arena::new()",
+    "Arena::with_capacity(bytes)",
+    "Arena::alloc<T>(val) -> &mut T",
+    "Arena::alloc_box<T>(val) -> ArenaBox<'_, T>",
+    "Arena::alloc_slice<T, I>(iter) -> &mut [T]",
+    "Arena::alloc_slice_copy<T: Copy>(src) -> &mut [T]",
+    "Arena::alloc_str(s) -> &str",
+    "Arena::alloc_uninit<T>() -> &mut MaybeUninit<T>",
+    "Arena::alloc_raw(size, align) -> NonNull<u8>",
+    "Arena::alloc_zeroed(size, align) -> NonNull<u8>",
+    "Arena::alloc_cache_aligned(size) -> NonNull<u8>",
+    "Arena::try_alloc / try_alloc_slice / try_alloc_str / try_alloc_raw",
+    "Arena::checkpoint() -> Checkpoint",
+    "Arena::rewind(cp: Checkpoint)",
+    "Arena::reset()",
+    "Arena::transaction() -> Transaction<'_>",
+    "Arena::with_transaction<F, T, E>(f) -> Result<T, E>",
+    "Arena::with_transaction_infallible<F, T>(f) -> T",
+    "Arena::stats() -> ArenaStats",
+    "ArenaBox<T>",
+    "Transaction<'arena>",
+    "Transaction::commit() -> TxnStatus",
+    "Transaction::rollback() -> TxnStatus",
+    "Transaction::savepoint() -> Transaction<'_>",
+    "Transaction::set_limit(bytes)",
+    "Transaction::budget_remaining() -> Option<usize>",
+    "Transaction::diff() -> TxnDiff",
+    "ArenaVec<T>",
+    "ArenaVec::new(arena) -> Self",
+    "ArenaVec::with_capacity(arena, cap) -> Self",
+    "ArenaVec::push(val)",
+    "ArenaVec::finish() -> &'arena mut [T]",
+    "ArenaVec::extend_exact(iter)",
+    "ArenaVec::extend_from_slice(slice)",
+    "ArenaVecIntoIter<T>",
+    "Checkpoint",
+    "ArenaStats",
+    "TxnStatus",
+    "TxnDiff",
+    "TryReserveError",
+    "arenavec! macro"
+  ]
+}

@@ -1,0 +1,230 @@
+---
+title: "Safety considerations"
+description: "Lifetime guarantees, thread safety, and safe patterns for fastarena."
+---
+
+## Lifetime guarantees
+
+Every reference returned by an `alloc*` method borrows the arena for the arena's lifetime. Calling `reset()` or `rewind()` while a live reference exists would leave a dangling pointer — undefined behavior in unsafe code.
+
+In **safe Rust**, the borrow checker catches this at compile time:
+
+<CodeGroup>
+
+```rust compile-time protection (safe code)
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+let x = arena.alloc(42i32); // x: &mut i32, borrows arena
+
+// arena.reset(); // ERROR: cannot borrow `arena` as mutable
+//                //        because it is also borrowed as mutable (x)
+
+println!("{x}"); // x still live here — compiler enforces this
+// x goes out of scope here
+
+arena.reset();   // now legal: no live borrows
+```
+
+```rust unsafe code — your responsibility
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+let x: *mut i32 = arena.alloc(42i32) as *mut _;  // raw pointer escapes borrow check
+
+arena.reset();  // memory reclaimed
+
+// unsafe { *x }  // UB: dangling pointer — do NOT do this
+```
+
+</CodeGroup>
+
+<Warning>
+  When you cast arena references to raw pointers (e.g. for cyclic structures or heterogeneous node graphs), the compiler no longer tracks their lifetimes. You are responsible for ensuring no raw pointer is dereferenced after a `reset()` or `rewind()` call.
+</Warning>
+
+## No thread safety
+
+`Arena` is `!Send + !Sync`. It cannot be shared across threads or moved to another thread after creation. For multi-threaded workloads, choose one of two patterns:
+
+<CodeGroup>
+
+```rust thread-local (recommended)
+use fastarena::Arena;
+use std::cell::RefCell;
+
+// Each thread gets its own arena — zero contention, no locks
+thread_local! {
+    static ARENA: RefCell<Arena> = RefCell::new(Arena::new());
+}
+
+fn handle_request() {
+    ARENA.with(|cell| {
+        let mut arena = cell.borrow_mut();
+        arena.alloc_str("request data");
+        // process...
+        arena.reset();
+    });
+}
+```
+
+```rust mutex wrapping (adds contention)
+use fastarena::Arena;
+use std::sync::Mutex;
+
+// Shared arena — every alloc acquires a lock
+let shared: Mutex<Arena> = Mutex::new(Arena::new());
+
+let mut guard = shared.lock().unwrap();
+guard.alloc(42u32);
+```
+
+</CodeGroup>
+
+<Note>
+  The thread-local pattern is strongly preferred for request-scoped workloads. A `Mutex<Arena>` serializes all allocations through a single lock and will bottleneck under any meaningful concurrency.
+</Note>
+
+## `finish()` vs `drop()` semantics
+
+`ArenaVec` has two exit paths with different destructor behavior:
+
+| Exit | Destructors | Arena memory |
+|---|---|---|
+| `finish()` | Not called | Owned by arena, lives until `reset()` / `rewind()` |
+| `drop()` without `finish()` | Run immediately at drop site | Retained by arena (capacity reused) |
+
+<CodeGroup>
+
+```rust finish() — no destructors, arena owns data
+use fastarena::{Arena, ArenaVec};
+
+let mut arena = Arena::new();
+
+let slice: &mut [String] = {
+    let mut v: ArenaVec<String> = ArenaVec::new(&mut arena);
+    v.push(String::from("hello"));
+    v.push(String::from("world"));
+    v.finish() // ArenaVec consumed; String destructors will NOT run here
+}; // slice lives as long as arena
+
+// Without drop-tracking: String::drop() is NEVER called — memory leaks until arena is dropped.
+// With drop-tracking feature: String::drop() runs in LIFO order on reset()/rewind().
+arena.reset();
+```
+
+```rust drop() without finish() — destructors run immediately
+use fastarena::{Arena, ArenaVec};
+
+let mut arena = Arena::new();
+
+{
+    let mut v: ArenaVec<String> = ArenaVec::new(&mut arena);
+    v.push(String::from("hello"));
+    // v dropped here — String::drop() fires immediately
+    // arena retains the backing memory for future allocations
+}
+```
+
+</CodeGroup>
+
+<Tip>
+  For `Copy` types (`u32`, `f64`, raw pointers, etc.) there are no destructors to worry about. Use `finish()` freely — there is no functional difference, but `finish()` is slightly cheaper because no drop registration occurs.
+</Tip>
+
+## Drop-tracking feature
+
+By default, fastarena never runs destructors — `reset()` and `rewind()` simply bump the pointer back, recovering memory instantly with zero per-object overhead.
+
+Enable the `drop-tracking` feature to register destructors and run them in LIFO order during `reset()` or `rewind()`:
+
+```toml
+[dependencies]
+fastarena = { version = "0.1.3", features = ["drop-tracking"] }
+```
+
+```rust drop-tracking in action
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+let cp = arena.checkpoint();
+
+arena.alloc(String::from("hello")); // registered for drop
+arena.alloc(String::from("world")); // registered for drop
+
+// With drop-tracking: "world" dropped first, then "hello" (LIFO)
+// Without drop-tracking: no destructors — memory reclaimed instantly
+arena.rewind(cp);
+```
+
+<Note>
+  Enable `drop-tracking` only when your arena-allocated types have meaningful destructors (e.g. `String`, `Vec`, file handles). For arenas of `Copy` types or plain structs without `Drop` impls, the default no-tracking mode is faster and preferable.
+</Note>
+
+## Budget tracking caveats
+
+The transaction budget tracks bytes written directly into arena blocks — it counts `size_of::<T>()` for each allocation. Heap memory owned by an allocated value is **not** counted.
+
+```rust budget only sees inline bytes
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+let mut txn = arena.transaction();
+txn.set_limit(100);
+
+// Stores a 24-byte Vec struct in the arena — budget sees 24 bytes.
+// The 1000-byte heap buffer is invisible to the budget.
+txn.alloc(vec![0u8; 1000]);
+println!("arena used: {} bytes", txn.bytes_used()); // ~24
+
+// To budget the actual data bytes, copy the data into the arena:
+let mut txn2 = arena.transaction();
+txn2.set_limit(100);
+txn2.alloc_slice(vec![0u8; 50]); // 50 arena bytes — budget sees all of it
+txn2.commit();
+```
+
+<Warning>
+  If you allocate types containing `Vec`, `String`, `Box`, or other heap-owning fields, the budget will under-count the actual memory consumed. Use `alloc_slice` / `alloc_slice_copy` to move data fully into the arena when accurate budget tracking matters.
+</Warning>
+
+## `alloc_raw` and `alloc_uninit` safety
+
+These methods return uninitialized memory. You are responsible for initializing every byte before reading:
+
+<CodeGroup>
+
+```rust alloc_uninit — must initialize before read
+use fastarena::Arena;
+use std::mem::MaybeUninit;
+
+let mut arena = Arena::new();
+
+let slot: &mut MaybeUninit<u64> = arena.alloc_uninit::<u64>();
+slot.write(0xDEAD_BEEF_u64);              // initialize
+
+let val: &mut u64 = unsafe { slot.assume_init_mut() }; // safe: initialized above
+assert_eq!(*val, 0xDEAD_BEEF_u64);
+```
+
+```rust alloc_raw — caller owns alignment and init
+use fastarena::Arena;
+use std::ptr::NonNull;
+
+let mut arena = Arena::new();
+
+// Page-aligned raw allocation — entirely uninitialized
+let raw: NonNull<u8> = arena.alloc_raw(4096, 4096);
+assert_eq!(raw.as_ptr() as usize % 4096, 0);
+
+// You must write before reading; reading uninitialized bytes is UB.
+unsafe {
+    std::ptr::write_bytes(raw.as_ptr(), 0u8, 4096); // zero-init manually
+}
+```
+
+</CodeGroup>
+
+<Warning>
+  Reading from `alloc_uninit` or `alloc_raw` memory before initialization is undefined behavior. Use `alloc_zeroed` when you need a guaranteed-zero raw buffer and do not want to initialize manually.
+</Warning>

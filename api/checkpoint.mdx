@@ -1,0 +1,163 @@
+---
+title: "Checkpoint"
+description: "An opaque, Copy snapshot of arena position for O(1) rewind."
+---
+
+A `Checkpoint` is an opaque snapshot of the arena's current allocation position. It is `Copy` and `Clone`, so it has zero cost to pass around or store multiple times. Taking a checkpoint costs the equivalent of copying three `usize` values — no allocation, no syscall.
+
+```rust
+#[derive(Debug, Clone, Copy)]
+pub struct Checkpoint { /* opaque */ }
+```
+
+## Taking a checkpoint
+
+Call `Arena::checkpoint()` at any point to record the current position:
+
+```rust
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+arena.alloc(10u64);           // some prior allocations
+
+let cp = arena.checkpoint();  // O(1) — copies block index, offset, bytes
+```
+
+## Rewinding to a checkpoint
+
+Call `Arena::rewind(cp)` to roll back all allocations made *after* the checkpoint was taken. Blocks are retained in memory and fully reusable — no memory is freed or returned to the OS.
+
+```rust
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+let x = arena.alloc(10u64);
+
+let cp = arena.checkpoint();
+
+arena.alloc(20u64);
+arena.alloc(30u64);
+// arena now logically holds [10, 20, 30]
+
+arena.rewind(cp);             // 20 and 30 gone; blocks retained for reuse
+assert_eq!(*x, 10);          // pre-checkpoint data is still valid
+```
+
+<Note>
+Data allocated **before** the checkpoint survives a `rewind`. Only allocations made after the snapshot are rolled back.
+</Note>
+
+## Checkpoint is Copy — pass it freely
+
+Because `Checkpoint` is `Copy`, you can copy, store, or pass it to functions with no overhead:
+
+```rust
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+let cp1 = arena.checkpoint();
+let cp2 = cp1;               // free copy — both refer to the same position
+
+arena.alloc(40u64);
+arena.rewind(cp2);           // 40 gone — cp1 still valid and identical
+```
+
+## Display
+
+`Checkpoint` implements `Display` and prints a human-readable summary of the saved position:
+
+```
+Checkpoint(block=0, offset=8, bytes=8)
+```
+
+```rust
+let cp = arena.checkpoint();
+println!("{cp}");  // e.g. "Checkpoint(block=0, offset=8, bytes=8)"
+```
+
+The three fields are:
+- **block** — index of the block that was active when the snapshot was taken
+- **offset** — byte offset within that block
+- **bytes** — total bytes allocated across all blocks at snapshot time
+
+## Speculative work pattern
+
+Checkpoints are the building block for "try something, undo if it fails" workflows — a common pattern in parsers, query planners, and compilers:
+
+<CodeGroup>
+
+```rust Speculative allocations
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+arena.alloc(1u64);            // baseline work
+
+let cp = arena.checkpoint();
+
+// Speculative allocations
+arena.alloc(2u64);
+arena.alloc(3u64);
+
+let success = false;          // hypothetical failure condition
+if !success {
+    arena.rewind(cp);         // undo speculative work, keep baseline
+}
+```
+
+```rust From examples/checkpoint_rewind.rs
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+
+// --- Basic checkpoint and rewind ---
+arena.alloc(1u64);
+let cp = arena.checkpoint();  // O(1) — copies 3 integers
+arena.alloc(2u64);
+arena.alloc(3u64);
+println!(
+    "before rewind: {} bytes, {} blocks",
+    arena.stats().bytes_allocated,
+    arena.block_count()
+);
+
+arena.rewind(cp);             // 2 and 3 gone; blocks retained for reuse
+println!(
+    "after rewind:  {} bytes, {} blocks",
+    arena.stats().bytes_allocated,
+    arena.block_count()
+);
+
+// --- Verify pre-checkpoint data survives ---
+let x_ptr = arena.alloc(0xDEAD_BEEF_u64) as *mut u64;
+let cp = arena.checkpoint();
+arena.alloc(0xCAFE_u64);
+arena.rewind(cp);
+assert_eq!(unsafe { *x_ptr }, 0xDEAD_BEEF);
+```
+
+</CodeGroup>
+
+## Checkpoint inside a transaction
+
+You can take a checkpoint from within a `Transaction` using `txn.checkpoint()`. This returns the checkpoint that was saved when the transaction opened:
+
+```rust
+use fastarena::Arena;
+
+let mut arena = Arena::new();
+let mut txn = arena.transaction();
+txn.alloc(1u32);
+
+let _cp = txn.checkpoint();   // the transaction's saved position
+txn.alloc(2u32);
+txn.arena_mut().alloc(3u32);
+println!("txn bytes_used: {}", txn.bytes_used());
+let _ = txn.commit();
+```
+
+## Complexity
+
+| Operation | Complexity | Notes |
+|-----------|------------|-------|
+| `checkpoint()` | O(1) | Copies 3 `usize` values |
+| `rewind(cp)` | O(k) | k ≈ 0–1 block transitions in the common case |

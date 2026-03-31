@@ -1,0 +1,55 @@
+---
+title: "Installation"
+description: "Add fastarena to your Rust project."
+---
+
+<Note>
+fastarena requires **Rust 1.66.0** or later. Run `rustup update stable` to ensure you're on a supported version.
+</Note>
+
+<Steps>
+  <Step title="Add the dependency">
+    Open your `Cargo.toml` and add fastarena under `[dependencies]`.
+
+    <CodeGroup>
+
+    ```toml Basic
+    [dependencies]
+    fastarena = "0.1.3"
+    ```
+
+    ```toml With drop-tracking
+    [dependencies]
+    fastarena = { version = "0.1.3", features = ["drop-tracking"] }
+    ```
+
+    </CodeGroup>
+  </Step>
+
+  <Step title="Choose your feature flags">
+    fastarena is zero-dependency with a minimal default surface. The only optional feature is `drop-tracking`.
+
+    | Flag | Default | Description |
+    |------|---------|-------------|
+    | `drop-tracking` | Off | Run destructors in LIFO order on `reset`/`rewind` |
+
+    Enable `drop-tracking` if you allocate types that implement `Drop` (such as `String` or `Vec`) and need their destructors to run when the arena is reset or rewound. When the flag is off, destructors never run and reset is a pure pointer operation — zero overhead.
+  </Step>
+
+  <Step title="Import and use">
+    Add the import to your Rust file and start allocating.
+
+    ```rust
+    use fastarena::Arena;
+
+    let mut arena = Arena::new();
+    let x: &mut u64 = arena.alloc(42);
+    arena.reset();
+    ```
+  </Step>
+</Steps>
+
+## Links
+
+- Crates.io: [https://crates.io/crates/fastarena](https://crates.io/crates/fastarena)
+- API docs: [https://docs.rs/fastarena](https://docs.rs/fastarena)
